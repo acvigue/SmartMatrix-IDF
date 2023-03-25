@@ -12,7 +12,7 @@
 #include <nvs_flash.h>
 #include <stdio.h>
 #include <string.h>
-#include <webp/demux.h>
+#include "webp/demux.h"
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
 

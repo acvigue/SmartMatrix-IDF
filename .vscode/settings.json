@@ -3,5 +3,14 @@
         "*.star": "python",
         "demux.h": "c",
         "esp32-hub75-matrixpanel-i2s-dma.h": "c"
-    }
+    },
+    "idf.port": "/dev/cu.usbserial-0001",
+    "idf.espIdfPath": "/Users/aiden/esp/esp-idf",
+    "idf.pythonBinPath": "/Users/aiden/.espressif/python_env/idf4.4_py3.11_env/bin/python",
+    "idf.toolsPath": "/Users/aiden/.espressif",
+    "idf.customExtraPaths": "/Users/aiden/.espressif/tools/xtensa-esp-elf-gdb/11.2_20220823/xtensa-esp-elf-gdb/bin:/Users/aiden/.espressif/tools/riscv32-esp-elf-gdb/11.2_20220823/riscv32-esp-elf-gdb/bin:/Users/aiden/.espressif/tools/xtensa-esp32-elf/esp-2021r2-patch5-8.4.0/xtensa-esp32-elf/bin:/Users/aiden/.espressif/tools/xtensa-esp32s2-elf/esp-2021r2-patch5-8.4.0/xtensa-esp32s2-elf/bin:/Users/aiden/.espressif/tools/xtensa-esp32s3-elf/esp-2021r2-patch5-8.4.0/xtensa-esp32s3-elf/bin:/Users/aiden/.espressif/tools/riscv32-esp-elf/esp-2021r2-patch5-8.4.0/riscv32-esp-elf/bin:/Users/aiden/.espressif/tools/esp32ulp-elf/2.35_20220830/esp32ulp-elf/bin:/Users/aiden/.espressif/tools/openocd-esp32/v0.11.0-esp32-20221026/openocd-esp32/bin:/Users/aiden/.espressif/tools/ninja/1.10.2",
+    "idf.customExtraVars": {
+        "OPENOCD_SCRIPTS": "/Users/aiden/.espressif/tools/openocd-esp32/v0.11.0-esp32-20221026/openocd-esp32/share/openocd/scripts"
+    },
+    "idf.gitPath": "git"
 }
