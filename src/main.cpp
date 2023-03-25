@@ -88,7 +88,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                 ESP_LOGI(WIFI_TAG, "STA started");
                 if (!provisioning) {
                     provisioning = true;
-                    wifi_prov_mgr_reset_provisioning();
+
                     /* check if device has been provisioned */
                     wifi_config_t wifi_cfg;
                     esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
@@ -98,6 +98,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
                     if (provisioned) {
                         ESP_LOGI(WIFI_TAG, "already provisioned, connecting..");
+                        provisioning = false;
                         esp_wifi_connect();
                     } else {
                         ESP_LOGI(WIFI_TAG,
@@ -106,26 +107,24 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                     }
                 }
                 break;
-            case WIFI_EVENT_STA_CONNECTED:
-                ESP_LOGI(WIFI_TAG, "STA connected!");
-                break;
             case WIFI_EVENT_STA_DISCONNECTED:
-                if (!provisioning) {
-                    wifiConnectionAttempts++;
-                    ESP_LOGI(WIFI_TAG, "STA disconnected");
-                    if (wifiConnectionAttempts > 5 && !provisioning) {
-                        ESP_LOGI(
-                            WIFI_TAG,
-                            "failure count reached, restarting provisioner..");
-                        provisioning = true;
-                        startProvisioning();
-                    }
-                    ESP_LOGI(WIFI_TAG, "STA reconnecting..");
-                    esp_wifi_connect();
+                wifiConnectionAttempts++;
+                ESP_LOGI(WIFI_TAG, "STA disconnected");
+                if (wifiConnectionAttempts > 5 && !provisioning) {
+                    ESP_LOGI(WIFI_TAG,
+                             "failure count reached, restarting provisioner..");
+                    provisioning = true;
+                    startProvisioning();
                 }
+                ESP_LOGI(WIFI_TAG, "STA reconnecting..");
+                esp_wifi_connect();
                 break;
             default:
                 break;
+        }
+    } else if(event_base == IP_EVENT) {
+        if(event_id == IP_EVENT_STA_GOT_IP) {
+            ESP_LOGI(WIFI_TAG, "STA connected!");
         }
     }
 }
@@ -181,6 +180,8 @@ extern "C" void app_main(void) {
                                                &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(
         WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               &event_handler, NULL));
 
     xTaskCreate(Worker_Task, "WorkerTask", 5000, NULL, 0, &workerTask);
     xTaskCreate(Matrix_Task, "MatrixTask", 5000, NULL, 0, &matrixTask);
