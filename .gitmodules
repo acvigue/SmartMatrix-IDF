@@ -1,0 +1,12 @@
+[submodule "components/ESP32-HUB75-MatrixPanel-DMA"]
+	path = components/ESP32-HUB75-MatrixPanel-DMA
+	url = https://github.com/acvigue/ESP32-HUB75-MatrixPanel-DMA
+[submodule "components/cJSON"]
+	path = components/cJSON
+	url = https://github.com/DaveGamble/cJSON
+[submodule "components/libwebp-pio"]
+	path = components/libwebp-pio
+	url = https://github.com/acvigue/libwebp-pio
+[submodule "components/esp_littlefs"]
+	path = components/esp_littlefs
+	url = https://github.com/joltwallet/esp_littlefs
