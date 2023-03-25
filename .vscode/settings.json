@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.star": "python",
+        "demux.h": "c",
+        "esp32-hub75-matrixpanel-i2s-dma.h": "c"
+    }
+}
