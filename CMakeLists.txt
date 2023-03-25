@@ -1,3 +1,15 @@
 cmake_minimum_required(VERSION 3.16.0)
+
+set(AWS_IOT_PATH "components/esp-aws-iot")
+
+set(EXTRA_COMPONENT_DIRS
+    "${AWS_IOT_PATH}/libraries"
+)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(smartmatrix-idf)
+
+# Create a LittleFS image from the contents of the 'LittleFS_image' directory
+# that fits the partition named 'storage'. The generated image should be flashed
+# when the entire project is flashed to the target with 'idf.py -p PORT flash'.
+littlefs_create_partition_image(littlefs fs_image)
