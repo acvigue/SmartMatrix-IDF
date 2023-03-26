@@ -12,5 +12,8 @@
     "idf.customExtraVars": {
         "OPENOCD_SCRIPTS": "/Users/aiden/.espressif/tools/openocd-esp32/v0.11.0-esp32-20221026/openocd-esp32/share/openocd/scripts"
     },
-    "idf.gitPath": "git"
+    "idf.gitPath": "git",
+    "idf.flashType": "UART",
+    "idf.flashBaudRate": "921600",
+    "idf.adapterTargetName": "esp32"
 }
