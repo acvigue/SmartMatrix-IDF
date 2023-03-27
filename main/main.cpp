@@ -12,19 +12,34 @@
 #include <nvs_flash.h>
 #include <stdio.h>
 #include <string.h>
-#include "webp/demux.h"
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
 
-static uint8_t spriteBuffer[50000];
+#include "webp/demux.h"
 
-char *serverCert;
-char *clientCert;
-char *clientKey;
+#define WORKITEM_TYPE_SHOW_SPRITE 1
+#define MATRIX_TASK_NOTIF_READY 1
+#define MATRIX_TASK_NOTIF_NOT_READY 2
+
+uint8_t spriteBuffer[50000];
+uint8_t decodedBuffer[4 * MATRIX_WIDTH * MATRIX_HEIGHT];
+WebPData webpData;
+WebPDemuxer *webpDemux;
+WebPIterator webpIterator;
+
+HUB75_I2S_CFG::i2s_pins _pins = {25, 26, 27, 14, 12, 13, 23,
+                                 19, 5,  17, -1, 4,  15, 16};
+HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
+MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
+
+char serverCert[1850];
+char clientCert[1850];
+char clientKey[1850];
 
 static const char *PROV_TAG = "[smx/provisioner]";
 static const char *BOOT_TAG = "[smx/boot]";
 static const char *MATRIX_TAG = "[smx/display]";
+static const char *WORKER_TAG = "[smx/worker]";
 static const char *MQTT_TAG = "[smx/mqtt]";
 static const char *WIFI_TAG = "[smx/wifi]";
 
@@ -123,12 +138,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                      event->error_handle->esp_tls_last_esp_err);
                 log_error_if_nonzero("reported from tls stack",
                                      event->error_handle->esp_tls_stack_err);
-                log_error_if_nonzero(
-                    "captured as transport's socket errno",
-                    event->error_handle->esp_transport_sock_errno);
-                ESP_LOGI(
-                    MQTT_TAG, "Last errno string (%s)",
-                    strerror(event->error_handle->esp_transport_sock_errno));
             }
             break;
         default:
@@ -162,14 +171,26 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             case WIFI_PROV_START:
                 provisioning = true;
                 ESP_LOGI(PROV_TAG, "provisioning started");
-                break;
-            default:
+
+                /* show setup sprite */
+                workerQueueItem workItem = {
+                    .type = WORKITEM_TYPE_SHOW_SPRITE,
+                };
+                strcpy(workItem.charParameter, "setup");
+                xQueueSend(workerQueue, &workItem, 100);
                 break;
         }
     } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
-            case WIFI_EVENT_STA_START:
+            case WIFI_EVENT_STA_START: {
                 ESP_LOGI(WIFI_TAG, "STA started");
+                /* show connect wifi sprite */
+                workerQueueItem workItem = {
+                    .type = WORKITEM_TYPE_SHOW_SPRITE,
+                };
+                strcpy(workItem.charParameter, "connect_wifi");
+                xQueueSend(workerQueue, &workItem, 100);
+
                 if (!provisioning) {
                     provisioning = true;
 
@@ -191,9 +212,11 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                     }
                 }
                 break;
-            case WIFI_EVENT_STA_DISCONNECTED:
+            }
+            case WIFI_EVENT_STA_DISCONNECTED: {
                 wifiConnectionAttempts++;
                 ESP_LOGI(WIFI_TAG, "STA disconnected");
+                esp_mqtt_client_stop(client);
                 if (wifiConnectionAttempts > 5 && !provisioning) {
                     ESP_LOGI(WIFI_TAG,
                              "failure count reached, restarting provisioner..");
@@ -203,49 +226,140 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                 ESP_LOGI(WIFI_TAG, "STA reconnecting..");
                 esp_wifi_connect();
                 break;
-            default:
-                break;
+            }
         }
     } else if (event_base == IP_EVENT) {
         if (event_id == IP_EVENT_STA_GOT_IP) {
             wifiConnectionAttempts = 0;
             ESP_LOGI(WIFI_TAG, "STA connected!");
 
-            // connect to mqtt
-            esp_mqtt_client_reconnect(client);
+            /* show connect_cloud sprite */
+            workerQueueItem workItem = {
+                .type = WORKITEM_TYPE_SHOW_SPRITE,
+            };
+            strcpy(workItem.charParameter, "connect_cloud");
+            xQueueSend(workerQueue, &workItem, 100);
+
+            esp_mqtt_client_start(client);
         }
     }
 }
 
 // MARK: Worker Task
 void Worker_Task(void *arg) {
-    workerQueue = xQueueCreate(5, sizeof(workerQueueItem));
-    if (workerQueue == 0) {
-        printf("Failed to create queue= %p\n", workerQueue);
-    }
-
     workerQueueItem workItem;
     while (1) {
-        if (xQueueReceive(workerQueue, &(workItem), (TickType_t)5)) {
-            printf("Received data from queue == %d/n", workItem.type);
+        if (xQueueReceive(workerQueue, &(workItem), (TickType_t)9999)) {
+            if (workItem.type == WORKITEM_TYPE_SHOW_SPRITE) {
+                char fileName[40];
+                snprintf(fileName, 40, "/littlefs/%s.webp",
+                         workItem.charParameter);
+                FILE *f = fopen(fileName, "r");
+                if (f == NULL) {
+                    ESP_LOGW(WORKER_TAG, "couldn't find sprite %s", fileName);
+                    continue;
+                }
+
+                fseek(f, 0, SEEK_END);
+                size_t fileSize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+
+                if (fileSize > sizeof(spriteBuffer)) {
+                    ESP_LOGE(WORKER_TAG, "sprite %s overflows buffer: %d",
+                             workItem.charParameter, fileSize);
+                    continue;
+                }
+
+                /* Tell the matrix task to pause while we're moving stuff around
+                 */
+                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_NOT_READY,
+                            eSetValueWithOverwrite);
+
+                fread(spriteBuffer, fileSize, fileSize, f);
+
+                webpData.bytes = spriteBuffer;
+                webpData.size = fileSize;
+
+                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
+                            eSetValueWithOverwrite);
+            }
         }
-        vTaskDelay(200 / portTICK_RATE_MS);
+        ESP_LOGI(WORKER_TAG, "watermark: %d",
+                 uxTaskGetStackHighWaterMark(NULL));
     }
 }
 
 // MARK: Matrix Task
 void Matrix_Task(void *arg) {
-    HUB75_I2S_CFG::i2s_pins _pins = {25, 26, 27, 14, 12, 13, 23,
-                                     19, 5,  17, -1, 4,  15, 16};
-    HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
-    MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
-    matrix.begin();
+    bool isReady = false;
+    int frameCount = 0;
+    int currentFrame = 0;
+    uint32_t lastFrameDuration = 0;
 
     while (1) {
-        vTaskDelay(5000 / portTICK_RATE_MS);
-        ESP_LOGI(MATRIX_TAG, "Free heap: %d, largest free block: %d",
-                 (int)esp_get_free_internal_heap_size(),
-                 (int)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        uint32_t notifiedValue;
+        uint32_t timeToWait = lastFrameDuration;
+        if (timeToWait == 0) {
+            timeToWait = 50;
+        }
+
+        if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue,
+                            pdMS_TO_TICKS(timeToWait))) {
+            if (notifiedValue == MATRIX_TASK_NOTIF_NOT_READY) {
+                WebPDemuxReleaseIterator(&webpIterator);
+                WebPDemuxDelete(webpDemux);
+                isReady = false;
+            } else if (notifiedValue == MATRIX_TASK_NOTIF_READY) {
+                webpDemux = WebPDemux(&webpData);
+                frameCount = WebPDemuxGetI(webpDemux, WEBP_FF_FRAME_COUNT);
+                currentFrame = 1;
+                isReady = true;
+            }
+        }
+
+        if (isReady) {
+            if (WebPDemuxGetFrame(webpDemux, currentFrame, &webpIterator)) {
+                if (WebPDecodeRGBAInto(
+                        webpIterator.fragment.bytes, webpIterator.fragment.size,
+                        decodedBuffer,
+                        webpIterator.width * webpIterator.height * 4,
+                        webpIterator.width * 4) != NULL) {
+                    int px = 0;
+                    for (int y = webpIterator.y_offset;
+                         y < (webpIterator.y_offset + webpIterator.height);
+                         y++) {
+                        for (int x = webpIterator.x_offset;
+                             x < (webpIterator.x_offset + webpIterator.width);
+                             x++) {
+                            // go pixel by pixel.
+
+                            int pixelOffsetFT = px * 4;
+                            int alphaValue = decodedBuffer[pixelOffsetFT + 3];
+
+                            if (alphaValue == 255) {
+                                matrix.drawPixel(
+                                    x, y,
+                                    matrix.color565(
+                                        decodedBuffer[pixelOffsetFT],
+                                        decodedBuffer[pixelOffsetFT + 1],
+                                        decodedBuffer[pixelOffsetFT + 2]));
+                            }
+
+                            px++;
+                        }
+                    }
+
+                    currentFrame++;
+                    lastFrameDuration = webpIterator.duration;
+                    if (currentFrame > frameCount) {
+                        currentFrame = 1;
+                    }
+                }
+            } else {
+                ESP_LOGE(MATRIX_TAG, "couldn't get frame");
+                isReady = false;
+            }
+        }
     }
 }
 
@@ -266,30 +380,26 @@ extern "C" void app_main(void) {
         .dont_mount = false,
     };
 
-    // Use settings defined above to initialize and mount LittleFS filesystem.
-    // Note: esp_vfs_littlefs_register is an all-in-one convenience function.
-    ret = esp_vfs_littlefs_register(&conf);
-
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(BOOT_TAG, "Failed to mount or format filesystem");
-        } else if (ret == ESP_ERR_NOT_FOUND) {
-            ESP_LOGE(BOOT_TAG, "Failed to find LittleFS partition");
-        } else {
-            ESP_LOGE(BOOT_TAG, "Failed to initialize LittleFS (%s)",
-                     esp_err_to_name(ret));
-        }
+    if (esp_vfs_littlefs_register(&conf) != ESP_OK) {
         return;
     }
 
-    size_t total = 0, used = 0;
-    ret = esp_littlefs_info(conf.partition_label, &total, &used);
-    if (ret != ESP_OK) {
-        ESP_LOGE(BOOT_TAG, "Failed to get LittleFS partition information (%s)",
-                 esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(BOOT_TAG, "Partition size: total: %d, used: %d", total, used);
+    workerQueue = xQueueCreate(5, sizeof(workerQueueItem));
+    if (workerQueue == 0) {
+        printf("Failed to create queue= %p\n", workerQueue);
     }
+    matrix.begin();
+
+    xTaskCreate(Worker_Task, "WorkerTask", 2500, NULL, 0, &workerTask);
+    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 30,
+                            &matrixTask, 1);
+
+    /* show boot sprite */
+    workerQueueItem workItem = {
+        .type = WORKITEM_TYPE_SHOW_SPRITE,
+    };
+    strcpy(workItem.charParameter, "boot");
+    xQueueSend(workerQueue, &workItem, 100);
 
     /* Initialize TCP/IP */
     ESP_ERROR_CHECK(esp_netif_init());
@@ -304,8 +414,8 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                &event_handler, NULL));
 
-    xTaskCreate(Worker_Task, "WorkerTask", 5000, NULL, 0, &workerTask);
-    xTaskCreate(Matrix_Task, "MatrixTask", 5000, NULL, 0, &matrixTask);
+    // Force boot anim to finish.
+    vTaskDelay(pdMS_TO_TICKS(5700));
 
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -325,7 +435,6 @@ extern "C" void app_main(void) {
     long size = ftell(f);   // get current file pointer
     fseek(f, 0, SEEK_SET);  // seek back to beginning of file
 
-    serverCert = (char *)malloc(size);
     fread(serverCert, size, size, f);
     fclose(f);
 
@@ -339,7 +448,6 @@ extern "C" void app_main(void) {
     size = ftell(f);        // get current file pointer
     fseek(f, 0, SEEK_SET);  // seek back to beginning of file
 
-    clientCert = (char *)malloc(size);
     fread(clientCert, size, size, f);
     fclose(f);
 
@@ -353,7 +461,6 @@ extern "C" void app_main(void) {
     size = ftell(f);        // get current file pointer
     fseek(f, 0, SEEK_SET);  // seek back to beginning of file
 
-    clientKey = (char *)malloc(size);
     fread(clientKey, size, size, f);
     fclose(f);
 
@@ -365,9 +472,14 @@ extern "C" void app_main(void) {
         .client_key_pem = clientKey};
 
     client = esp_mqtt_client_init(&mqtt_cfg);
+
     /* The last argument may be used to pass data to the event handler,
      * in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler,
                                    NULL);
-    esp_mqtt_client_start(client);
+
+    while (1) {
+        ESP_LOGI(BOOT_TAG, "free heap: %d", esp_get_free_heap_size());
+        vTaskDelay(10000 / portTICK_RATE_MS);
+    }
 }
