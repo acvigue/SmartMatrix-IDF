@@ -1,4 +1,5 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <cJSON.h>
 #include <esp_event.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
@@ -12,14 +13,11 @@
 #include <nvs_flash.h>
 #include <stdio.h>
 #include <string.h>
+#include <webp/demux.h>
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
 
-#include "webp/demux.h"
-
-#define WORKITEM_TYPE_SHOW_SPRITE 1
-#define MATRIX_TASK_NOTIF_READY 1
-#define MATRIX_TASK_NOTIF_NOT_READY 2
+#include "constants.h"
 
 uint8_t spriteBuffer[50000];
 uint8_t decodedBuffer[4 * MATRIX_WIDTH * MATRIX_HEIGHT];
@@ -36,23 +34,10 @@ char serverCert[1850];
 char clientCert[1850];
 char clientKey[1850];
 
-static const char *PROV_TAG = "[smx/provisioner]";
-static const char *BOOT_TAG = "[smx/boot]";
-static const char *MATRIX_TAG = "[smx/display]";
-static const char *WORKER_TAG = "[smx/worker]";
-static const char *MQTT_TAG = "[smx/mqtt]";
-static const char *WIFI_TAG = "[smx/wifi]";
-
 TaskHandle_t matrixTask;
 TaskHandle_t workerTask;
 QueueHandle_t workerQueue;
 esp_mqtt_client_handle_t client;
-
-struct workerQueueItem {
-    uint8_t type;
-    int numericParameter;
-    char charParameter[300];
-};
 
 static void startProvisioning() {
     wifi_prov_security_t security = WIFI_PROV_SECURITY_0;
@@ -75,12 +60,6 @@ static void startProvisioning() {
     /* Start provisioning service */
     ESP_ERROR_CHECK(
         wifi_prov_mgr_start_provisioning(security, NULL, service_name, NULL));
-}
-
-static void log_error_if_nonzero(const char *message, int error_code) {
-    if (error_code != 0) {
-        ESP_LOGE(BOOT_TAG, "Last error %s: 0x%x", message, error_code);
-    }
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
@@ -106,47 +85,41 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             esp_mqtt_client_subscribe(client, tmpTopic, 1);
             sprintf(tmpTopic, "smartmatrix/%s/schedule", device_id);
             esp_mqtt_client_subscribe(client, tmpTopic, 1);
-
-            ESP_LOGI(MQTT_TAG, "subscribed");
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
             break;
-
-        case MQTT_EVENT_SUBSCRIBED:
-            ESP_LOGI(MQTT_TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d",
-                     event->msg_id);
-            break;
-        case MQTT_EVENT_UNSUBSCRIBED:
-            ESP_LOGI(MQTT_TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d",
-                     event->msg_id);
-            break;
-        case MQTT_EVENT_PUBLISHED:
-            ESP_LOGI(MQTT_TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d",
-                     event->msg_id);
-            break;
         case MQTT_EVENT_DATA:
-            ESP_LOGI(MQTT_TAG, "MQTT_EVENT_DATA");
-            printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-            printf("DATA=%.*s\r\n", event->data_len, event->data);
-            break;
-        case MQTT_EVENT_ERROR:
-            ESP_LOGI(MQTT_TAG, "MQTT_EVENT_ERROR");
-            if (event->error_handle->error_type ==
-                MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-                log_error_if_nonzero("reported from esp-tls",
-                                     event->error_handle->esp_tls_last_esp_err);
-                log_error_if_nonzero("reported from tls stack",
-                                     event->error_handle->esp_tls_stack_err);
+            if (strstr(event->topic, "command")) {
+                cJSON *root = cJSON_Parse(event->data);
+                char *type = cJSON_GetObjectItem(root, "type")->valuestring;
+                if (strcmp(type, "download_sprite") == 0) {
+                    cJSON *params = cJSON_GetObjectItem(root, "params");
+                    char *spriteURL =
+                        cJSON_GetObjectItem(params, "url")->valuestring;
+                    int spriteID =
+                        cJSON_GetObjectItem(params, "spriteID")->valueint;
+
+                    /* tell worker to download the sprite */
+                    workerQueueItem workItem = {
+                        .type = WORKITEM_TYPE_DOWNLOAD_SPRITE,
+                        .numericParameter = spriteID,
+                    };
+                    strcpy(workItem.charParameter, spriteURL);
+                    xQueueSend(workerQueue, &workItem, 100);
+                } else {
+                    ESP_LOGE(MQTT_TAG, "Received unknown command: %s", type);
+                }
+                cJSON_Delete(root);
+            } else if(strstr(event->topic, "applet")) {
+                ESP_LOGI(MQTT_TAG, "applet: %d: %s", event->data_len, event->data);
             }
             break;
         default:
-            ESP_LOGI(MQTT_TAG, "Other event id:%d", event->event_id);
             break;
     }
 }
 
-/* Event handler for catching system events */
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data) {
     static uint8_t wifiConnectionAttempts;
@@ -289,7 +262,6 @@ void Worker_Task(void *arg) {
     }
 }
 
-// MARK: Matrix Task
 void Matrix_Task(void *arg) {
     bool isReady = false;
     int frameCount = 0;
@@ -384,12 +356,12 @@ extern "C" void app_main(void) {
         return;
     }
 
+    /*Create worker queue & tasks */
     workerQueue = xQueueCreate(5, sizeof(workerQueueItem));
     if (workerQueue == 0) {
         printf("Failed to create queue= %p\n", workerQueue);
     }
     matrix.begin();
-
     xTaskCreate(Worker_Task, "WorkerTask", 2500, NULL, 0, &workerTask);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 30,
                             &matrixTask, 1);
@@ -417,6 +389,8 @@ extern "C" void app_main(void) {
     // Force boot anim to finish.
     vTaskDelay(pdMS_TO_TICKS(5700));
 
+    /* Initialize WiFi, this will start the provisioner/mqtt client as
+     * necessary */
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -431,9 +405,9 @@ extern "C" void app_main(void) {
         return;
     }
 
-    fseek(f, 0, SEEK_END);  // seek to end of file
-    long size = ftell(f);   // get current file pointer
-    fseek(f, 0, SEEK_SET);  // seek back to beginning of file
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
     fread(serverCert, size, size, f);
     fclose(f);
@@ -444,9 +418,9 @@ extern "C" void app_main(void) {
         return;
     }
 
-    fseek(f, 0, SEEK_END);  // seek to end of file
-    size = ftell(f);        // get current file pointer
-    fseek(f, 0, SEEK_SET);  // seek back to beginning of file
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
     fread(clientCert, size, size, f);
     fclose(f);
@@ -457,9 +431,9 @@ extern "C" void app_main(void) {
         return;
     }
 
-    fseek(f, 0, SEEK_END);  // seek to end of file
-    size = ftell(f);        // get current file pointer
-    fseek(f, 0, SEEK_SET);  // seek back to beginning of file
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
     fread(clientKey, size, size, f);
     fclose(f);
@@ -469,17 +443,18 @@ extern "C" void app_main(void) {
         .uri = "mqtts://***REDACTED***:443",
         .cert_pem = serverCert,
         .client_cert_pem = clientCert,
-        .client_key_pem = clientKey};
+        .client_key_pem = clientKey,
+    };
 
     client = esp_mqtt_client_init(&mqtt_cfg);
 
-    /* The last argument may be used to pass data to the event handler,
-     * in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler,
                                    NULL);
 
     while (1) {
-        ESP_LOGI(BOOT_TAG, "free heap: %d", esp_get_free_heap_size());
-        vTaskDelay(10000 / portTICK_RATE_MS);
+        ESP_LOGI(BOOT_TAG, "free heap: %d, contigious: %d",
+                 esp_get_free_heap_size(),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        vTaskDelay(2500 / portTICK_RATE_MS);
     }
 }
