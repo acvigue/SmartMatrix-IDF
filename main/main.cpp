@@ -20,11 +20,11 @@
 
 #include "constants.h"
 
-uint8_t spriteBuffer[50000];
-uint8_t decodedBuffer[4 * MATRIX_WIDTH * MATRIX_HEIGHT];
-WebPData webpData;
-WebPDemuxer *webpDemux;
-WebPIterator webpIterator;
+static uint8_t spriteBuffer[50000];
+static uint8_t decBuffer[4 * MATRIX_WIDTH * MATRIX_HEIGHT];
+static WebPData iData;
+WebPDemuxer *demux;
+static WebPIterator iter;
 
 HUB75_I2S_CFG::i2s_pins _pins = {25, 26, 27, 14, 12, 13, 23,
                                  19, 5,  17, -1, 4,  15, 16};
@@ -40,6 +40,12 @@ TaskHandle_t matrixTask;
 TaskHandle_t workerTask;
 QueueHandle_t workerQueue;
 esp_mqtt_client_handle_t mqttClient;
+
+int currentlyShowingSprite = -1;
+int currentSpriteDuration = 0;
+unsigned long currentSpriteStartTime;
+int scheduledSpriteCount = 0;
+scheduledSprite scheduledSprites[100];
 
 static void startProvisioning() {
     wifi_prov_security_t security = WIFI_PROV_SECURITY_0;
@@ -130,7 +136,7 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
                             if (hashFile != NULL) {
                                 fwrite(((httpDownloadItem *)evt->user_data)
                                            ->receivedHash,
-                                       33, 33, hashFile);
+                                       1, 33, hashFile);
                                 fclose(hashFile);
                                 ESP_LOGD(HTTP_TAG,
                                          "wrote new hash for sprite %d: %s",
@@ -199,7 +205,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     break;
                 }
                 char *type = cJSON_GetObjectItem(root, "type")->valuestring;
-                if (strcmp(type, "sprite_manifest") == 0) {
+                if (strcmp(type, "new_sprite") == 0) {
                     cJSON *params = cJSON_GetObjectItem(root, "params");
 
                     workerQueueItem workItem = {
@@ -212,6 +218,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                            cJSON_GetObjectItem(params, "url")->valuestring);
 
                     xQueueSend(workerQueue, &workItem, 100);
+                } else if (strcmp(type, "new_schedule") == 0) {
+                    cJSON *schedule = cJSON_GetObjectItem(root, "schedule");
+                    const char *hash =
+                        cJSON_GetObjectItem(root, "hash")->valuestring;
+                    for (int i = 0; i < cJSON_GetArraySize(schedule); i++) {
+                        cJSON *event = cJSON_GetArrayItem(schedule, i);
+                        scheduledSprites[i].duration =
+                            cJSON_GetObjectItem(event, "d")->valueint;
+                        scheduledSprites[i].skipped =
+                            cJSON_GetObjectItem(event, "s")->valueint;
+                        scheduledSprites[i].pinned =
+                            cJSON_GetObjectItem(event, "p")->valueint;
+                    }
+                    scheduledSpriteCount = cJSON_GetArraySize(schedule);
+                    ESP_LOGI(MQTT_TAG, "received %d items for schedule",
+                             scheduledSpriteCount);
+                    char resp[100];
+                    snprintf(resp, 100,
+                             "{\"type\":\"schedule_loaded\",\"hash\":\"%s\"}",
+                             hash);
+                    esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1,
+                                            0);
                 } else {
                     ESP_LOGE(MQTT_TAG, "Received unknown command: %s", type);
                 }
@@ -352,8 +380,8 @@ void Worker_Task(void *arg) {
 
                 fread(spriteBuffer, 1, fileSize, f);
 
-                webpData.bytes = spriteBuffer;
-                webpData.size = fileSize;
+                iData.bytes = spriteBuffer;
+                iData.size = fileSize;
 
                 xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
                             eSetValueWithOverwrite);
@@ -412,43 +440,46 @@ void Matrix_Task(void *arg) {
         if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue,
                             pdMS_TO_TICKS(timeToWait))) {
             if (notifiedValue == MATRIX_TASK_NOTIF_NOT_READY) {
-                WebPDemuxReleaseIterator(&webpIterator);
-                WebPDemuxDelete(webpDemux);
+                WebPDemuxReleaseIterator(&iter);
+                WebPDemuxDelete(demux);
                 isReady = false;
             } else if (notifiedValue == MATRIX_TASK_NOTIF_READY) {
-                webpDemux = WebPDemux(&webpData);
-                frameCount = WebPDemuxGetI(webpDemux, WEBP_FF_FRAME_COUNT);
+                demux = WebPDemux(&iData);
+                if(demux == NULL) {
+                    ESP_LOGE(MATRIX_TAG, "couldn't create demuxer!");
+                    continue;
+                }
+                frameCount = WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT);
                 currentFrame = 1;
                 isReady = true;
             }
         }
 
         if (isReady) {
-            if (WebPDemuxGetFrame(webpDemux, currentFrame, &webpIterator)) {
+            if (WebPDemuxGetFrame(demux, currentFrame, &iter)) {
                 if (WebPDecodeRGBAInto(
-                        webpIterator.fragment.bytes, webpIterator.fragment.size,
-                        decodedBuffer,
-                        webpIterator.width * webpIterator.height * 4,
-                        webpIterator.width * 4) != NULL) {
+                        iter.fragment.bytes, iter.fragment.size,
+                        decBuffer,
+                        iter.width * iter.height * 4,
+                        iter.width * 4) != NULL) {
                     int px = 0;
-                    for (int y = webpIterator.y_offset;
-                         y < (webpIterator.y_offset + webpIterator.height);
+                    for (int y = iter.y_offset;
+                         y < (iter.y_offset + iter.height);
                          y++) {
-                        for (int x = webpIterator.x_offset;
-                             x < (webpIterator.x_offset + webpIterator.width);
+                        for (int x = iter.x_offset;
+                             x < (iter.x_offset + iter.width);
                              x++) {
-                            // go pixel by pixel.
 
                             int pixelOffsetFT = px * 4;
-                            int alphaValue = decodedBuffer[pixelOffsetFT + 3];
+                            int alphaValue = decBuffer[pixelOffsetFT + 3];
 
                             if (alphaValue == 255) {
                                 matrix.drawPixel(
                                     x, y,
                                     matrix.color565(
-                                        decodedBuffer[pixelOffsetFT],
-                                        decodedBuffer[pixelOffsetFT + 1],
-                                        decodedBuffer[pixelOffsetFT + 2]));
+                                        decBuffer[pixelOffsetFT],
+                                        decBuffer[pixelOffsetFT + 1],
+                                        decBuffer[pixelOffsetFT + 2]));
                             }
 
                             px++;
@@ -456,16 +487,25 @@ void Matrix_Task(void *arg) {
                     }
 
                     currentFrame++;
-                    lastFrameDuration = webpIterator.duration;
+                    lastFrameDuration = iter.duration;
                     if (currentFrame > frameCount) {
                         currentFrame = 1;
                     }
+                } else {
+                    ESP_LOGE(MATRIX_TAG, "couldn't decode frame %d",
+                             currentFrame);
+                    WebPDemuxReleaseIterator(&iter);
+                    WebPDemuxDelete(demux);
+                    isReady = false;
+                    xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
+                                eSetValueWithOverwrite);
                 }
             } else {
-                ESP_LOGE(MATRIX_TAG, "couldn't get frame");
-                WebPDemuxReleaseIterator(&webpIterator);
-                WebPDemuxDelete(webpDemux);
-                xTaskNotify(NULL, MATRIX_TASK_NOTIF_READY,
+                ESP_LOGE(MATRIX_TAG, "couldn't get frame %d", currentFrame + 1);
+                WebPDemuxReleaseIterator(&iter);
+                WebPDemuxDelete(demux);
+                isReady = false;
+                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
                             eSetValueWithOverwrite);
             }
         }
@@ -502,8 +542,8 @@ extern "C" void app_main(void) {
     }
     matrix.begin();
     xTaskCreate(Worker_Task, "WorkerTask", 3500, NULL, 0, &workerTask);
-    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 30,
-                            &matrixTask, 1);
+    xTaskCreate(Matrix_Task, "MatrixTask", 3500, NULL, 10,
+                            &matrixTask);
 
     /* show boot sprite */
     workerQueueItem workItem = {
@@ -579,14 +619,62 @@ extern "C" void app_main(void) {
 
     /* Setup MQTT */
     const esp_mqtt_client_config_t mqtt_cfg = {
-        .uri = "mqtts://***REDACTED***:443",
-        .cert_pem = serverCert,
-        .client_cert_pem = clientCert,
-        .client_key_pem = clientKey,
+        .uri = "mqtt://***REDACTED***:1883",
+        .username = "***REDACTED***",
+        .password = "***REDACTED***"
     };
 
     mqttClient = esp_mqtt_client_init(&mqtt_cfg);
 
     esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
                                    mqtt_event_handler, NULL);
+
+    int scheduleCheckID = -1;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGI(BOOT_TAG, "heap: %d", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        if (pdTICKS_TO_MS(xTaskGetTickCount()) - currentSpriteStartTime >
+            currentSpriteDuration) {
+            if (scheduledSpriteCount == 0) {
+                continue;
+            }
+
+            int tcID = scheduleCheckID;
+            scheduleCheckID++;
+
+            if (scheduleCheckID >= scheduledSpriteCount) {
+                scheduleCheckID = 0;
+                tcID = scheduledSpriteCount - 1;
+            }
+
+            bool currentAppletPinned = scheduledSprites[tcID].pinned;
+            bool skipApplet = scheduledSprites[scheduleCheckID].skipped;
+            int duration = scheduledSprites[scheduleCheckID].duration;
+
+            if (currentAppletPinned) {
+                continue;
+            }
+
+            if (skipApplet) {
+                continue;
+            }
+
+            ESP_LOGI(SCHEDULE_TAG, "showing %d", scheduleCheckID);
+
+            char newAppletName[15];
+            snprintf(newAppletName, 15, "sprites/%d", scheduleCheckID);
+
+            /* show connect_cloud sprite */
+            workerQueueItem workItem = {
+                .type = WORKITEM_TYPE_SHOW_SPRITE,
+            };
+            strcpy(workItem.charParameter, newAppletName);
+            xQueueSend(workerQueue, &workItem, 100);
+
+            currentlyShowingSprite = scheduleCheckID;
+            currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
+            currentSpriteDuration =
+                scheduledSprites[currentlyShowingSprite].duration * 1000;
+        }
+    }
 }

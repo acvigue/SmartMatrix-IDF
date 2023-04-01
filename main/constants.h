@@ -10,7 +10,8 @@
 #define MQTT_TAG "[smx/mqtt]"
 #define WIFI_TAG "[smx/wifi]"
 #define WORKER_TAG "[smx/worker]"
-#define HTTP_TAG "[smx/worker]"
+#define HTTP_TAG "[smx/http]"
+#define SCHEDULE_TAG "[smx/schedule]"
 
 /* Inter-task communication values */
 #define WORKITEM_TYPE_SHOW_SPRITE 1
@@ -28,6 +29,12 @@ struct httpDownloadItem {
     int spriteID;
     bool shouldDownload;
     char receivedHash[33];
+};
+
+struct scheduledSprite {
+    int duration = 0;
+    bool pinned = false;
+    bool skipped = false;
 };
 
 #endif
