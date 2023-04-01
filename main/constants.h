@@ -26,7 +26,8 @@ struct workerQueueItem {
 
 struct httpDownloadItem {
     int spriteID;
-    char hash[100];
+    bool shouldDownload;
+    char receivedHash[33];
 };
 
 #endif

@@ -1,6 +1,7 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <cJSON.h>
 #include <esp_event.h>
+#include <esp_http_client.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
@@ -33,11 +34,12 @@ MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
 char serverCert[1850];
 char clientCert[1850];
 char clientKey[1850];
+char statusTopic[40];
 
 TaskHandle_t matrixTask;
 TaskHandle_t workerTask;
 QueueHandle_t workerQueue;
-esp_mqtt_client_handle_t client;
+esp_mqtt_client_handle_t mqttClient;
 
 static void startProvisioning() {
     wifi_prov_security_t security = WIFI_PROV_SECURITY_0;
@@ -62,57 +64,158 @@ static void startProvisioning() {
         wifi_prov_mgr_start_provisioning(security, NULL, service_name, NULL));
 }
 
+esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
+    static int current_data_offset;  // Stores number of bytes read
+    switch (evt->event_id) {
+        case HTTP_EVENT_ON_HEADER: {
+            if (strcmp("ETag", evt->header_key) == 0) {
+                strncpy(((httpDownloadItem *)evt->user_data)->receivedHash,
+                        evt->header_value + 1, 32);
+                char hashFileName[30];
+                snprintf(hashFileName, 30, "/littlefs/sprites/%d.hash",
+                         ((httpDownloadItem *)evt->user_data)->spriteID);
+                FILE *existingHashFile = fopen(hashFileName, "r");
+                if (existingHashFile != NULL) {
+                    char existingHash[33];
+                    fread(existingHash, 1, 33, existingHashFile);
+                    if (strcmp(existingHash,
+                               ((httpDownloadItem *)evt->user_data)
+                                   ->receivedHash) == 0) {
+                        ESP_LOGI(
+                            HTTP_TAG,
+                            "ETag hash matches stored sprite %d, skipping.",
+                            ((httpDownloadItem *)evt->user_data)->spriteID);
+                        ((httpDownloadItem *)evt->user_data)->shouldDownload =
+                            false;
+                        esp_http_client_close(evt->client);
+                    }
+                } else {
+                    ESP_LOGW(HTTP_TAG, "couldn't open existing hash file: %s",
+                             hashFileName);
+                }
+            }
+            break;
+        }
+        case HTTP_EVENT_ON_DATA: {
+            bool shouldDownload =
+                ((httpDownloadItem *)evt->user_data)->shouldDownload;
+            if (shouldDownload) {
+                char tmpFileName[35];
+                snprintf(tmpFileName, 35, "/littlefs/sprites/%d.webp.tmp",
+                         ((httpDownloadItem *)evt->user_data)->spriteID);
+                FILE *spriteFile = fopen(tmpFileName, "a");
+                if (spriteFile != NULL) {
+                    fwrite(evt->data, 1, evt->data_len, spriteFile);
+                    fclose(spriteFile);
+
+                    int total = esp_http_client_get_content_length(evt->client);
+                    ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_DATA, len=%d, offset=%d",
+                             evt->data_len, current_data_offset);
+
+                    if (current_data_offset + evt->data_len >= total) {
+                        ESP_LOGD(
+                            HTTP_TAG, "recv'd %d bytes of data for sprite %d",
+                            total,
+                            ((httpDownloadItem *)evt->user_data)->spriteID);
+                        char newFileName[35];
+                        snprintf(
+                            newFileName, 35, "/littlefs/sprites/%d.webp",
+                            ((httpDownloadItem *)evt->user_data)->spriteID);
+                        if (rename(tmpFileName, newFileName) == 0) {
+                            char hashFileName[30];
+                            snprintf(
+                                hashFileName, 30, "/littlefs/sprites/%d.hash",
+                                ((httpDownloadItem *)evt->user_data)->spriteID);
+                            FILE *hashFile = fopen(hashFileName, "w");
+                            if (hashFile != NULL) {
+                                fwrite(((httpDownloadItem *)evt->user_data)
+                                           ->receivedHash,
+                                       33, 33, hashFile);
+                                fclose(hashFile);
+                                ESP_LOGD(HTTP_TAG,
+                                         "wrote new hash for sprite %d: %s",
+                                         ((httpDownloadItem *)evt->user_data)
+                                             ->spriteID,
+                                         hashFileName);
+                            } else {
+                                ESP_LOGE(HTTP_TAG,
+                                         "couldn't open new hash file for "
+                                         "writing: %s",
+                                         hashFileName);
+                            }
+                        } else {
+                            ESP_LOGE(HTTP_TAG, "couldn't rename sprite file");
+                        }
+                    }
+                    current_data_offset += evt->data_len;
+                } else {
+                    ESP_LOGE(HTTP_TAG,
+                             "couldn't open sprite file for writing: %s",
+                             tmpFileName);
+                }
+            }
+            break;
+        }
+        case HTTP_EVENT_ON_FINISH: {
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_FINISH");
+            current_data_offset = 0;
+            break;
+        }
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data) {
-    ESP_LOGD(MQTT_TAG,
-             "Event dispatched from event loop base=%s, event_id=%" PRIi32,
-             base, event_id);
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-    esp_mqtt_client_handle_t client = event->client;
+    esp_mqtt_client_handle_t mqttClient = event->client;
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(MQTT_TAG, "connected to cloud");
 
-            char device_id[7];
             char tmpTopic[40];
             uint8_t eth_mac[6];
+            char device_id[7];
             esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
             snprintf(device_id, 7, "%02X%02X%02X", eth_mac[3], eth_mac[4],
                      eth_mac[5]);
             sprintf(tmpTopic, "smartmatrix/%s/command", device_id);
-            esp_mqtt_client_subscribe(client, tmpTopic, 1);
-            sprintf(tmpTopic, "smartmatrix/%s/applet", device_id);
-            esp_mqtt_client_subscribe(client, tmpTopic, 1);
+            esp_mqtt_client_subscribe(mqttClient, tmpTopic, 1);
             sprintf(tmpTopic, "smartmatrix/%s/schedule", device_id);
-            esp_mqtt_client_subscribe(client, tmpTopic, 1);
+            esp_mqtt_client_subscribe(mqttClient, tmpTopic, 1);
+            sprintf(statusTopic, "smartmatrix/%s/status", device_id);
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
+            esp_mqtt_client_reconnect(mqttClient);
             break;
         case MQTT_EVENT_DATA:
             if (strstr(event->topic, "command")) {
                 cJSON *root = cJSON_Parse(event->data);
+                if (!cJSON_HasObjectItem(root, "type")) {
+                    ESP_LOGE(MQTT_TAG, "command event had no command!");
+                    break;
+                }
                 char *type = cJSON_GetObjectItem(root, "type")->valuestring;
-                if (strcmp(type, "download_sprite") == 0) {
+                if (strcmp(type, "sprite_manifest") == 0) {
                     cJSON *params = cJSON_GetObjectItem(root, "params");
-                    char *spriteURL =
-                        cJSON_GetObjectItem(params, "url")->valuestring;
-                    int spriteID =
-                        cJSON_GetObjectItem(params, "spriteID")->valueint;
 
-                    /* tell worker to download the sprite */
                     workerQueueItem workItem = {
                         .type = WORKITEM_TYPE_DOWNLOAD_SPRITE,
-                        .numericParameter = spriteID,
+                        .numericParameter =
+                            cJSON_GetObjectItem(params, "spriteID")->valueint,
                     };
-                    strcpy(workItem.charParameter, spriteURL);
+
+                    strcpy(workItem.charParameter,
+                           cJSON_GetObjectItem(params, "url")->valuestring);
+
                     xQueueSend(workerQueue, &workItem, 100);
                 } else {
                     ESP_LOGE(MQTT_TAG, "Received unknown command: %s", type);
                 }
                 cJSON_Delete(root);
-            } else if(strstr(event->topic, "applet")) {
-                ESP_LOGI(MQTT_TAG, "applet: %d: %s", event->data_len, event->data);
             }
             break;
         default:
@@ -189,7 +292,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             case WIFI_EVENT_STA_DISCONNECTED: {
                 wifiConnectionAttempts++;
                 ESP_LOGI(WIFI_TAG, "STA disconnected");
-                esp_mqtt_client_stop(client);
+                esp_mqtt_client_stop(mqttClient);
                 if (wifiConnectionAttempts > 5 && !provisioning) {
                     ESP_LOGI(WIFI_TAG,
                              "failure count reached, restarting provisioner..");
@@ -213,7 +316,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             strcpy(workItem.charParameter, "connect_cloud");
             xQueueSend(workerQueue, &workItem, 100);
 
-            esp_mqtt_client_start(client);
+            esp_mqtt_client_start(mqttClient);
         }
     }
 }
@@ -230,6 +333,13 @@ void Worker_Task(void *arg) {
                 FILE *f = fopen(fileName, "r");
                 if (f == NULL) {
                     ESP_LOGW(WORKER_TAG, "couldn't find sprite %s", fileName);
+                    char resp[200];
+                    snprintf(resp, 200,
+                             "{\"type\":\"sprite_not_found\",\"params\":{"
+                             "\"id\":%d}}",
+                             workItem.numericParameter);
+                    esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1,
+                                            0);
                     continue;
                 }
 
@@ -237,28 +347,52 @@ void Worker_Task(void *arg) {
                 size_t fileSize = ftell(f);
                 fseek(f, 0, SEEK_SET);
 
-                if (fileSize > sizeof(spriteBuffer)) {
-                    ESP_LOGE(WORKER_TAG, "sprite %s overflows buffer: %d",
-                             workItem.charParameter, fileSize);
-                    continue;
-                }
-
-                /* Tell the matrix task to pause while we're moving stuff around
-                 */
                 xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_NOT_READY,
                             eSetValueWithOverwrite);
 
-                fread(spriteBuffer, fileSize, fileSize, f);
+                fread(spriteBuffer, 1, fileSize, f);
 
                 webpData.bytes = spriteBuffer;
                 webpData.size = fileSize;
 
                 xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
                             eSetValueWithOverwrite);
+
+                char resp[200];
+                snprintf(resp, 200,
+                         "{\"type\":\"sprite_shown\",\"params\":{\"id\":%d}}",
+                         workItem.numericParameter);
+                esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1, 0);
+            } else if (workItem.type == WORKITEM_TYPE_DOWNLOAD_SPRITE) {
+                ESP_LOGD(WORKER_TAG, "receiving sprite %d: %s",
+                         workItem.numericParameter, workItem.charParameter);
+
+                httpDownloadItem httpItem = {
+                    .spriteID = workItem.numericParameter,
+                    .shouldDownload = true,
+                };
+
+                esp_http_client_config_t config = {
+                    .url = workItem.charParameter,
+                    .event_handler = _http_event_handler,
+                    .buffer_size = 2048,
+                    .user_data = (void *)&httpItem,
+                    .skip_cert_common_name_check = true,
+                };
+
+                esp_http_client_handle_t client = esp_http_client_init(&config);
+
+                esp_http_client_perform(client);
+                esp_http_client_cleanup(client);
+
+                char resp[200];
+                snprintf(resp, 200,
+                         "{\"type\":\"sprite_loaded\",\"params\":{\"id\":%"
+                         "d,\"hash\":\"%s\"}}",
+                         workItem.numericParameter, httpItem.receivedHash);
+                esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1, 0);
             }
         }
-        ESP_LOGI(WORKER_TAG, "watermark: %d",
-                 uxTaskGetStackHighWaterMark(NULL));
     }
 }
 
@@ -329,7 +463,10 @@ void Matrix_Task(void *arg) {
                 }
             } else {
                 ESP_LOGE(MATRIX_TAG, "couldn't get frame");
-                isReady = false;
+                WebPDemuxReleaseIterator(&webpIterator);
+                WebPDemuxDelete(webpDemux);
+                xTaskNotify(NULL, MATRIX_TASK_NOTIF_READY,
+                            eSetValueWithOverwrite);
             }
         }
     }
@@ -354,6 +491,8 @@ extern "C" void app_main(void) {
 
     if (esp_vfs_littlefs_register(&conf) != ESP_OK) {
         return;
+    } else {
+        mkdir("/littlefs/sprites", 0775);
     }
 
     /*Create worker queue & tasks */
@@ -362,7 +501,7 @@ extern "C" void app_main(void) {
         printf("Failed to create queue= %p\n", workerQueue);
     }
     matrix.begin();
-    xTaskCreate(Worker_Task, "WorkerTask", 2500, NULL, 0, &workerTask);
+    xTaskCreate(Worker_Task, "WorkerTask", 3500, NULL, 0, &workerTask);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 30,
                             &matrixTask, 1);
 
@@ -409,7 +548,7 @@ extern "C" void app_main(void) {
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    fread(serverCert, size, size, f);
+    fread(serverCert, 1, size, f);
     fclose(f);
 
     f = fopen("/littlefs/certs/clientAuth.pem", "r");
@@ -422,7 +561,7 @@ extern "C" void app_main(void) {
     size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    fread(clientCert, size, size, f);
+    fread(clientCert, 1, size, f);
     fclose(f);
 
     f = fopen("/littlefs/certs/clientAuth.key", "r");
@@ -435,7 +574,7 @@ extern "C" void app_main(void) {
     size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    fread(clientKey, size, size, f);
+    fread(clientKey, 1, size, f);
     fclose(f);
 
     /* Setup MQTT */
@@ -446,15 +585,8 @@ extern "C" void app_main(void) {
         .client_key_pem = clientKey,
     };
 
-    client = esp_mqtt_client_init(&mqtt_cfg);
+    mqttClient = esp_mqtt_client_init(&mqtt_cfg);
 
-    esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler,
-                                   NULL);
-
-    while (1) {
-        ESP_LOGI(BOOT_TAG, "free heap: %d, contigious: %d",
-                 esp_get_free_heap_size(),
-                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        vTaskDelay(2500 / portTICK_RATE_MS);
-    }
+    esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
+                                   mqtt_event_handler, NULL);
 }
