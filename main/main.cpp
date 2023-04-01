@@ -620,8 +620,9 @@ extern "C" void app_main(void) {
     /* Setup MQTT */
     const esp_mqtt_client_config_t mqtt_cfg = {
         .uri = "mqtt://***REDACTED***:1883",
-        .username = "***REDACTED***",
-        .password = "***REDACTED***"
+        .cert_pem = serverCert,
+        .client_cert_pem = clientCert,
+        .client_key_pem = clientKey
     };
 
     mqttClient = esp_mqtt_client_init(&mqtt_cfg);
