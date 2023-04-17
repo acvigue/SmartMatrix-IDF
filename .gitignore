@@ -1,4 +1,5 @@
 .pio
 build
-sdkconfig
-fs_image/certs/*
+fs_image/*.key
+fs_image/*.crt
+sdkconfig.old

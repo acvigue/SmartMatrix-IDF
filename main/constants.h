@@ -9,32 +9,11 @@
 #define MATRIX_TAG "[smx/display]"
 #define MQTT_TAG "[smx/mqtt]"
 #define WIFI_TAG "[smx/wifi]"
-#define WORKER_TAG "[smx/worker]"
 #define HTTP_TAG "[smx/http]"
 #define SCHEDULE_TAG "[smx/schedule]"
 
 /* Inter-task communication values */
-#define WORKITEM_TYPE_SHOW_SPRITE 1
-#define WORKITEM_TYPE_DOWNLOAD_SPRITE 2
 #define MATRIX_TASK_NOTIF_READY 1
 #define MATRIX_TASK_NOTIF_NOT_READY 2
-
-struct workerQueueItem {
-    uint8_t type;
-    int numericParameter;
-    char charParameter[300];
-};
-
-struct httpDownloadItem {
-    int spriteID;
-    bool shouldDownload;
-    char receivedHash[33];
-};
-
-struct scheduledSprite {
-    int duration = 0;
-    bool pinned = false;
-    bool skipped = false;
-};
 
 #endif

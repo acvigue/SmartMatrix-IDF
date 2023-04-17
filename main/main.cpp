@@ -1,13 +1,11 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <cJSON.h>
+#include <esp_crt_bundle.h>
 #include <esp_event.h>
-#include <esp_http_client.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/event_groups.h>
-#include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/timers.h>
 #include <mqtt_client.h>
@@ -19,164 +17,35 @@
 #include <wifi_provisioning/scheme_ble.h>
 
 #include "constants.h"
+#include "pins.h"
 
-static uint8_t spriteBuffer[50000];
-static uint8_t decBuffer[4 * MATRIX_WIDTH * MATRIX_HEIGHT];
-static WebPData iData;
-WebPDemuxer *demux;
-static WebPIterator iter;
-
-HUB75_I2S_CFG::i2s_pins _pins = {25, 26, 27, 14, 12, 13, 23,
-                                 19, 5,  17, -1, 4,  15, 16};
-HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
-MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
-
-char serverCert[1850];
-char clientCert[1850];
-char clientKey[1850];
+WebPData webPData;
+WebPAnimDecoder *dec = nullptr;
 char statusTopic[40];
+char schedule[1024];
 
 TaskHandle_t matrixTask;
-TaskHandle_t workerTask;
-QueueHandle_t workerQueue;
 esp_mqtt_client_handle_t mqttClient;
 
-int currentlyShowingSprite = -1;
-int currentSpriteDuration = 0;
-unsigned long currentSpriteStartTime;
-int scheduledSpriteCount = 0;
-scheduledSprite scheduledSprites[100];
+int currentlyShowingApplet = 0;
+int currentAppletDuration = 0;
+unsigned long currentAppletStartTime;
+int scheduledAppletCount = 0;
+static bool skipStates[100];
+static int appletDurations[100];
+static bool hasSentBoot = false;
+static char lastTopic[50];
+static FILE *pushingAppletFile;
+static int pushingAppletID;
 
-static void startProvisioning() {
-    wifi_prov_security_t security = WIFI_PROV_SECURITY_0;
-
-    /* Configuration for the provisioning manager */
-    wifi_prov_mgr_config_t config = {
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
-    /* Initialize provisioning manager with the
-     * configuration parameters set above */
-    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
-
-    char service_name[18];
-    uint8_t eth_mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
-    snprintf(service_name, 18, "%s%02X%02X%02X%02X%02X%02X", "PROV_",
-             eth_mac[0], eth_mac[1], eth_mac[2], eth_mac[3], eth_mac[4],
-             eth_mac[5]);
-
-    /* Start provisioning service */
-    ESP_ERROR_CHECK(
-        wifi_prov_mgr_start_provisioning(security, NULL, service_name, NULL));
-}
-
-esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
-    static int current_data_offset;  // Stores number of bytes read
-    switch (evt->event_id) {
-        case HTTP_EVENT_ON_HEADER: {
-            if (strcmp("ETag", evt->header_key) == 0) {
-                strncpy(((httpDownloadItem *)evt->user_data)->receivedHash,
-                        evt->header_value + 1, 32);
-                char hashFileName[30];
-                snprintf(hashFileName, 30, "/littlefs/sprites/%d.hash",
-                         ((httpDownloadItem *)evt->user_data)->spriteID);
-                FILE *existingHashFile = fopen(hashFileName, "r");
-                if (existingHashFile != NULL) {
-                    char existingHash[33];
-                    fread(existingHash, 1, 33, existingHashFile);
-                    if (strcmp(existingHash,
-                               ((httpDownloadItem *)evt->user_data)
-                                   ->receivedHash) == 0) {
-                        ESP_LOGI(
-                            HTTP_TAG,
-                            "ETag hash matches stored sprite %d, skipping.",
-                            ((httpDownloadItem *)evt->user_data)->spriteID);
-                        ((httpDownloadItem *)evt->user_data)->shouldDownload =
-                            false;
-                        esp_http_client_close(evt->client);
-                    }
-                } else {
-                    ESP_LOGW(HTTP_TAG, "couldn't open existing hash file: %s",
-                             hashFileName);
-                }
-            }
-            break;
-        }
-        case HTTP_EVENT_ON_DATA: {
-            bool shouldDownload =
-                ((httpDownloadItem *)evt->user_data)->shouldDownload;
-            if (shouldDownload) {
-                char tmpFileName[35];
-                snprintf(tmpFileName, 35, "/littlefs/sprites/%d.webp.tmp",
-                         ((httpDownloadItem *)evt->user_data)->spriteID);
-                FILE *spriteFile = fopen(tmpFileName, "a");
-                if (spriteFile != NULL) {
-                    fwrite(evt->data, 1, evt->data_len, spriteFile);
-                    fclose(spriteFile);
-
-                    int total = esp_http_client_get_content_length(evt->client);
-                    ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_DATA, len=%d, offset=%d",
-                             evt->data_len, current_data_offset);
-
-                    if (current_data_offset + evt->data_len >= total) {
-                        ESP_LOGD(
-                            HTTP_TAG, "recv'd %d bytes of data for sprite %d",
-                            total,
-                            ((httpDownloadItem *)evt->user_data)->spriteID);
-                        char newFileName[35];
-                        snprintf(
-                            newFileName, 35, "/littlefs/sprites/%d.webp",
-                            ((httpDownloadItem *)evt->user_data)->spriteID);
-                        if (rename(tmpFileName, newFileName) == 0) {
-                            char hashFileName[30];
-                            snprintf(
-                                hashFileName, 30, "/littlefs/sprites/%d.hash",
-                                ((httpDownloadItem *)evt->user_data)->spriteID);
-                            FILE *hashFile = fopen(hashFileName, "w");
-                            if (hashFile != NULL) {
-                                fwrite(((httpDownloadItem *)evt->user_data)
-                                           ->receivedHash,
-                                       1, 33, hashFile);
-                                fclose(hashFile);
-                                ESP_LOGD(HTTP_TAG,
-                                         "wrote new hash for sprite %d: %s",
-                                         ((httpDownloadItem *)evt->user_data)
-                                             ->spriteID,
-                                         hashFileName);
-                            } else {
-                                ESP_LOGE(HTTP_TAG,
-                                         "couldn't open new hash file for "
-                                         "writing: %s",
-                                         hashFileName);
-                            }
-                        } else {
-                            ESP_LOGE(HTTP_TAG, "couldn't rename sprite file");
-                        }
-                    }
-                    current_data_offset += evt->data_len;
-                } else {
-                    ESP_LOGE(HTTP_TAG,
-                             "couldn't open sprite file for writing: %s",
-                             tmpFileName);
-                }
-            }
-            break;
-        }
-        case HTTP_EVENT_ON_FINISH: {
-            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_FINISH");
-            current_data_offset = 0;
-            break;
-        }
-        default:
-            break;
-    }
-    return ESP_OK;
-}
+void workerTaskCode(void *arg);
+void showApplet(const char *name);
+void showNextApplet();
+void startProvisioner();
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-    esp_mqtt_client_handle_t mqttClient = event->client;
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(MQTT_TAG, "connected to cloud");
@@ -188,62 +57,108 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             snprintf(device_id, 7, "%02X%02X%02X", eth_mac[3], eth_mac[4],
                      eth_mac[5]);
             sprintf(tmpTopic, "smartmatrix/%s/command", device_id);
-            esp_mqtt_client_subscribe(mqttClient, tmpTopic, 1);
+            // esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
             sprintf(tmpTopic, "smartmatrix/%s/schedule", device_id);
-            esp_mqtt_client_subscribe(mqttClient, tmpTopic, 1);
+            // esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+            sprintf(tmpTopic, "smartmatrix/%s/applet", device_id);
+            // esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
             sprintf(statusTopic, "smartmatrix/%s/status", device_id);
+
+            if (!hasSentBoot) {
+                const char *resp = "{\"type\":\"boot\"}";
+                // esp_mqtt_client_publish(event->client, statusTopic, resp, 0,
+                // 1,
+                //                         0);
+                hasSentBoot = true;
+            }
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
-            esp_mqtt_client_reconnect(mqttClient);
             break;
         case MQTT_EVENT_DATA:
-            if (strstr(event->topic, "command")) {
+            if (event->topic_len != 0) {
+                strcpy(lastTopic, event->topic);
+            }
+            if (strstr(lastTopic, "command")) {
                 cJSON *root = cJSON_Parse(event->data);
-                if (!cJSON_HasObjectItem(root, "type")) {
+                if (!cJSON_HasObjectItem(root, "command")) {
                     ESP_LOGE(MQTT_TAG, "command event had no command!");
                     break;
                 }
-                char *type = cJSON_GetObjectItem(root, "type")->valuestring;
-                if (strcmp(type, "new_sprite") == 0) {
+                char *type = cJSON_GetObjectItem(root, "command")->valuestring;
+                if (strcmp(type, "ping") == 0) {
+                    const char *resp = "{\"type\":\"pong\"}";
+                    esp_mqtt_client_publish(event->client, statusTopic, resp, 0,
+                                            1, 0);
+                } else if (strcmp(type, "send_app_graphic") == 0) {
                     cJSON *params = cJSON_GetObjectItem(root, "params");
 
-                    workerQueueItem workItem = {
-                        .type = WORKITEM_TYPE_DOWNLOAD_SPRITE,
-                        .numericParameter =
-                            cJSON_GetObjectItem(params, "spriteID")->valueint,
-                    };
+                    fclose(pushingAppletFile);
+                    pushingAppletID =
+                        atoi(cJSON_GetObjectItem(params, "appid")->valuestring);
 
-                    strcpy(workItem.charParameter,
-                           cJSON_GetObjectItem(params, "url")->valuestring);
+                    char tmpFileName[25];
+                    sprintf(tmpFileName, "/littlefs/%d.webp.tmp",
+                            pushingAppletID);
+                    unlink(tmpFileName);
 
-                    xQueueSend(workerQueue, &workItem, 100);
-                } else if (strcmp(type, "new_schedule") == 0) {
-                    cJSON *schedule = cJSON_GetObjectItem(root, "schedule");
-                    const char *hash =
-                        cJSON_GetObjectItem(root, "hash")->valuestring;
-                    for (int i = 0; i < cJSON_GetArraySize(schedule); i++) {
-                        cJSON *event = cJSON_GetArrayItem(schedule, i);
-                        scheduledSprites[i].duration =
-                            cJSON_GetObjectItem(event, "d")->valueint;
-                        scheduledSprites[i].skipped =
-                            cJSON_GetObjectItem(event, "s")->valueint;
-                        scheduledSprites[i].pinned =
-                            cJSON_GetObjectItem(event, "p")->valueint;
+                    pushingAppletFile = fopen(tmpFileName, "w");
+                    const char *resp =
+                        "{\"type\":\"success\",\"info\":\"applet_update\","
+                        "\"next\":\"send_chunk\"}";
+                    esp_mqtt_client_publish(event->client, statusTopic, resp, 0,
+                                            1, 0);
+                } else if (strcmp(type, "app_graphic_stop") == 0) {
+                    fclose(pushingAppletFile);
+                    char tmpFileName[25];
+                    sprintf(tmpFileName, "/littlefs/%d.webp.tmp",
+                            pushingAppletID);
+
+                    unlink(tmpFileName);
+                    const char *resp =
+                        "{\"type\":\"success\",\"info\":\"applet_update\","
+                        "\"next\":\"send_next\"}";
+                    esp_mqtt_client_publish(event->client, statusTopic, resp, 0,
+                                            1, 0);
+                } else if (strcmp(type, "app_graphic_sent") == 0) {
+                    fclose(pushingAppletFile);
+
+                    // Move temp file to real applet
+                    char tmpFileName[25];
+                    char realFileName[25];
+                    sprintf(tmpFileName, "/littlefs/%d.webp.tmp",
+                            pushingAppletID);
+                    sprintf(realFileName, "/littlefs/%d.webp", pushingAppletID);
+
+                    if (rename(tmpFileName, realFileName) == 0) {
+                        const char *resp =
+                            "{\"type\":\"success\",\"info\":\"applet_update\","
+                            "\"next\":\"none\"}";
+                        esp_mqtt_client_publish(event->client, statusTopic,
+                                                resp, 0, 1, 0);
                     }
-                    scheduledSpriteCount = cJSON_GetArraySize(schedule);
-                    ESP_LOGI(MQTT_TAG, "received %d items for schedule",
-                             scheduledSpriteCount);
-                    char resp[100];
-                    snprintf(resp, 100,
-                             "{\"type\":\"schedule_loaded\",\"hash\":\"%s\"}",
-                             hash);
-                    esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1,
-                                            0);
                 } else {
                     ESP_LOGE(MQTT_TAG, "Received unknown command: %s", type);
                 }
                 cJSON_Delete(root);
+            } else if (strstr(lastTopic, "schedule")) {
+                strcpy(schedule, event->data);
+            } else if (strstr(lastTopic, "applet")) {
+                if (event->current_data_offset == 0) {
+                    ESP_LOGI(MQTT_TAG, "receiving %d bytes for %d",
+                             event->data_len, pushingAppletID);
+                }
+                fwrite(event->data, 1, event->data_len, pushingAppletFile);
+                if (event->current_data_offset + event->data_len >=
+                    event->total_data_len) {
+                    ESP_LOGI(MQTT_TAG, "stored %d bytes for %d",
+                             event->total_data_len, pushingAppletID);
+                    const char *resp =
+                        "{\"type\":\"success\",\"info\":\"applet_update\","
+                        "\"next\":\"send_chunk\"}";
+                    esp_mqtt_client_publish(event->client, statusTopic, resp, 0,
+                                            1, 0);
+                }
             }
             break;
         default:
@@ -275,25 +190,15 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             case WIFI_PROV_START:
                 provisioning = true;
                 ESP_LOGI(PROV_TAG, "provisioning started");
-
-                /* show setup sprite */
-                workerQueueItem workItem = {
-                    .type = WORKITEM_TYPE_SHOW_SPRITE,
-                };
-                strcpy(workItem.charParameter, "setup");
-                xQueueSend(workerQueue, &workItem, 100);
+                showApplet("setup");
                 break;
         }
     } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
             case WIFI_EVENT_STA_START: {
                 ESP_LOGI(WIFI_TAG, "STA started");
-                /* show connect wifi sprite */
-                workerQueueItem workItem = {
-                    .type = WORKITEM_TYPE_SHOW_SPRITE,
-                };
-                strcpy(workItem.charParameter, "connect_wifi");
-                xQueueSend(workerQueue, &workItem, 100);
+                /* show connect wifi applet */
+                showApplet("connect_wifi");
 
                 if (!provisioning) {
                     provisioning = true;
@@ -312,7 +217,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                     } else {
                         ESP_LOGI(WIFI_TAG,
                                  "not provisioned, starting provisioner..");
-                        startProvisioning();
+                        startProvisioner();
                     }
                 }
                 break;
@@ -325,7 +230,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                     ESP_LOGI(WIFI_TAG,
                              "failure count reached, restarting provisioner..");
                     provisioning = true;
-                    startProvisioning();
+                    startProvisioner();
                 }
                 ESP_LOGI(WIFI_TAG, "STA reconnecting..");
                 esp_wifi_connect();
@@ -337,179 +242,106 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             wifiConnectionAttempts = 0;
             ESP_LOGI(WIFI_TAG, "STA connected!");
 
-            /* show connect_cloud sprite */
-            workerQueueItem workItem = {
-                .type = WORKITEM_TYPE_SHOW_SPRITE,
-            };
-            strcpy(workItem.charParameter, "connect_cloud");
-            xQueueSend(workerQueue, &workItem, 100);
+            showApplet("connect_cloud");
 
             esp_mqtt_client_start(mqttClient);
         }
     }
 }
 
-// MARK: Worker Task
-void Worker_Task(void *arg) {
-    workerQueueItem workItem;
-    while (1) {
-        if (xQueueReceive(workerQueue, &(workItem), (TickType_t)9999)) {
-            if (workItem.type == WORKITEM_TYPE_SHOW_SPRITE) {
-                char fileName[40];
-                snprintf(fileName, 40, "/littlefs/%s.webp",
-                         workItem.charParameter);
-                FILE *f = fopen(fileName, "r");
-                if (f == NULL) {
-                    ESP_LOGW(WORKER_TAG, "couldn't find sprite %s", fileName);
-                    char resp[200];
-                    snprintf(resp, 200,
-                             "{\"type\":\"sprite_not_found\",\"params\":{"
-                             "\"id\":%d}}",
-                             workItem.numericParameter);
-                    esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1,
-                                            0);
-                    continue;
-                }
-
-                fseek(f, 0, SEEK_END);
-                size_t fileSize = ftell(f);
-                fseek(f, 0, SEEK_SET);
-
-                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_NOT_READY,
-                            eSetValueWithOverwrite);
-
-                fread(spriteBuffer, 1, fileSize, f);
-
-                iData.bytes = spriteBuffer;
-                iData.size = fileSize;
-
-                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
-                            eSetValueWithOverwrite);
-
-                char resp[200];
-                snprintf(resp, 200,
-                         "{\"type\":\"sprite_shown\",\"params\":{\"id\":%d}}",
-                         workItem.numericParameter);
-                esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1, 0);
-            } else if (workItem.type == WORKITEM_TYPE_DOWNLOAD_SPRITE) {
-                ESP_LOGD(WORKER_TAG, "receiving sprite %d: %s",
-                         workItem.numericParameter, workItem.charParameter);
-
-                httpDownloadItem httpItem = {
-                    .spriteID = workItem.numericParameter,
-                    .shouldDownload = true,
-                };
-
-                esp_http_client_config_t config = {
-                    .url = workItem.charParameter,
-                    .event_handler = _http_event_handler,
-                    .buffer_size = 2048,
-                    .user_data = (void *)&httpItem,
-                    .skip_cert_common_name_check = true,
-                };
-
-                esp_http_client_handle_t client = esp_http_client_init(&config);
-
-                esp_http_client_perform(client);
-                esp_http_client_cleanup(client);
-
-                char resp[200];
-                snprintf(resp, 200,
-                         "{\"type\":\"sprite_loaded\",\"params\":{\"id\":%"
-                         "d,\"hash\":\"%s\"}}",
-                         workItem.numericParameter, httpItem.receivedHash);
-                esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1, 0);
-            }
-        }
-    }
-}
-
 void Matrix_Task(void *arg) {
     bool isReady = false;
-    int frameCount = 0;
+    unsigned long animStartTS = 0;
+    int lastFrameTimestamp = 0;
     int currentFrame = 0;
-    uint32_t lastFrameDuration = 0;
+    int errorCount = 0;
+
+    HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN,  B1_PIN, R2_PIN, G2_PIN,
+                                     B2_PIN, A_PIN,   B_PIN,  C_PIN,  D_PIN,
+                                     E_PIN,  LAT_PIN, OE_PIN, CLK_PIN};
+    HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
+    MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
+    matrix.begin();
 
     while (1) {
         uint32_t notifiedValue;
-        uint32_t timeToWait = lastFrameDuration;
-        if (timeToWait == 0) {
-            timeToWait = 50;
-        }
 
         if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue,
-                            pdMS_TO_TICKS(timeToWait))) {
+                            pdMS_TO_TICKS(30))) {
             if (notifiedValue == MATRIX_TASK_NOTIF_NOT_READY) {
-                WebPDemuxReleaseIterator(&iter);
-                WebPDemuxDelete(demux);
+                WebPAnimDecoderDelete(dec);
                 isReady = false;
             } else if (notifiedValue == MATRIX_TASK_NOTIF_READY) {
-                demux = WebPDemux(&iData);
-                if(demux == NULL) {
-                    ESP_LOGE(MATRIX_TAG, "couldn't create demuxer!");
+                dec = WebPAnimDecoderNew(&webPData, NULL);
+                if (dec == NULL) {
                     continue;
                 }
-                frameCount = WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT);
-                currentFrame = 1;
+                animStartTS = pdTICKS_TO_MS(xTaskGetTickCount());
+                lastFrameTimestamp = 0;
+                currentFrame = 0;
+                errorCount = 0;
                 isReady = true;
             }
         }
 
         if (isReady) {
-            if (WebPDemuxGetFrame(demux, currentFrame, &iter)) {
-                if (WebPDecodeRGBAInto(
-                        iter.fragment.bytes, iter.fragment.size,
-                        decBuffer,
-                        iter.width * iter.height * 4,
-                        iter.width * 4) != NULL) {
-                    int px = 0;
-                    for (int y = iter.y_offset;
-                         y < (iter.y_offset + iter.height);
-                         y++) {
-                        for (int x = iter.x_offset;
-                             x < (iter.x_offset + iter.width);
-                             x++) {
+            if (pdTICKS_TO_MS(xTaskGetTickCount()) - animStartTS >
+                lastFrameTimestamp) {
+                if (currentFrame == 0) {
+                    animStartTS = pdTICKS_TO_MS(xTaskGetTickCount());
+                    lastFrameTimestamp = 0;
+                }
 
-                            int pixelOffsetFT = px * 4;
-                            int alphaValue = decBuffer[pixelOffsetFT + 3];
-
-                            if (alphaValue == 255) {
+                bool hasMoreFrames = WebPAnimDecoderHasMoreFrames(dec);
+                if (hasMoreFrames) {
+                    uint8_t *buf;
+                    if (WebPAnimDecoderGetNext(dec, &buf,
+                                               &lastFrameTimestamp)) {
+                        int px = 0;
+                        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+                            for (int x = 0; x < MATRIX_WIDTH; x++) {
                                 matrix.drawPixel(
                                     x, y,
-                                    matrix.color565(
-                                        decBuffer[pixelOffsetFT],
-                                        decBuffer[pixelOffsetFT + 1],
-                                        decBuffer[pixelOffsetFT + 2]));
+                                    matrix.color565(buf[px * 4],
+                                                    buf[px * 4 + 1],
+                                                    buf[px * 4 + 2]));
+
+                                px++;
                             }
-
-                            px++;
                         }
+                        currentFrame++;
+                        if (!WebPAnimDecoderHasMoreFrames(dec)) {
+                            currentFrame = 0;
+                            WebPAnimDecoderReset(dec);
+                        }
+                    } else {
+                        isReady = false;
                     }
-
-                    currentFrame++;
-                    lastFrameDuration = iter.duration;
-                    if (currentFrame > frameCount) {
-                        currentFrame = 1;
-                    }
-                } else {
-                    ESP_LOGE(MATRIX_TAG, "couldn't decode frame %d",
-                             currentFrame);
-                    WebPDemuxReleaseIterator(&iter);
-                    WebPDemuxDelete(demux);
-                    isReady = false;
-                    xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
-                                eSetValueWithOverwrite);
                 }
-            } else {
-                ESP_LOGE(MATRIX_TAG, "couldn't get frame %d", currentFrame + 1);
-                WebPDemuxReleaseIterator(&iter);
-                WebPDemuxDelete(demux);
-                isReady = false;
-                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY,
-                            eSetValueWithOverwrite);
             }
         }
     }
+}
+
+char *read_file_from_littlefs(const char *fileName) {
+    char fileName2[40];
+    snprintf(fileName2, 40, "/littlefs/%s", fileName);
+    FILE *f = fopen(fileName2, "r");
+    if (f == NULL) {
+        ESP_LOGE(BOOT_TAG, "couldn't find file %s", fileName);
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size_t fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *value = (char *)malloc(fileSize);
+
+    fread((void *)value, 1, fileSize, f);
+    fclose(f);
+
+    return value;
 }
 
 extern "C" void app_main(void) {
@@ -531,26 +363,13 @@ extern "C" void app_main(void) {
 
     if (esp_vfs_littlefs_register(&conf) != ESP_OK) {
         return;
-    } else {
-        mkdir("/littlefs/sprites", 0775);
     }
 
-    /*Create worker queue & tasks */
-    workerQueue = xQueueCreate(5, sizeof(workerQueueItem));
-    if (workerQueue == 0) {
-        printf("Failed to create queue= %p\n", workerQueue);
-    }
-    matrix.begin();
-    xTaskCreate(Worker_Task, "WorkerTask", 3500, NULL, 0, &workerTask);
-    xTaskCreate(Matrix_Task, "MatrixTask", 3500, NULL, 10,
-                            &matrixTask);
+    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 20000, NULL, 5,
+                            &matrixTask, 1);
 
-    /* show boot sprite */
-    workerQueueItem workItem = {
-        .type = WORKITEM_TYPE_SHOW_SPRITE,
-    };
-    strcpy(workItem.charParameter, "boot");
-    xQueueSend(workerQueue, &workItem, 100);
+    /* show boot applet */
+    showApplet("boot");
 
     /* Initialize TCP/IP */
     ESP_ERROR_CHECK(esp_netif_init());
@@ -565,9 +384,6 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                &event_handler, NULL));
 
-    // Force boot anim to finish.
-    vTaskDelay(pdMS_TO_TICKS(5700));
-
     /* Initialize WiFi, this will start the provisioner/mqtt client as
      * necessary */
     esp_netif_create_default_wifi_sta();
@@ -577,105 +393,90 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Read out certs from FS */
-    FILE *f = fopen("/littlefs/certs/LetsEncryptR3.pem", "r");
-    if (f == NULL) {
-        ESP_LOGE(BOOT_TAG, "Failed to open file for reading");
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    fread(serverCert, 1, size, f);
-    fclose(f);
-
-    f = fopen("/littlefs/certs/clientAuth.pem", "r");
-    if (f == NULL) {
-        ESP_LOGE(BOOT_TAG, "Failed to open file for reading");
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    fread(clientCert, 1, size, f);
-    fclose(f);
-
-    f = fopen("/littlefs/certs/clientAuth.key", "r");
-    if (f == NULL) {
-        ESP_LOGE(BOOT_TAG, "Failed to open file for reading");
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    fread(clientKey, 1, size, f);
-    fclose(f);
+    char *private_key = read_file_from_littlefs("client.key");
+    char *certificate = read_file_from_littlefs("client.crt");
 
     /* Setup MQTT */
     const esp_mqtt_client_config_t mqtt_cfg = {
-        .uri = "mqtt://***REDACTED***:1883",
-        .cert_pem = serverCert,
-        .client_cert_pem = clientCert,
-        .client_key_pem = clientKey
-    };
+        .broker = {.address = "mqtts://***REDACTED***",
+                   .verification =
+                       {
+                           .crt_bundle_attach = esp_crt_bundle_attach,
+                       }},
+        .credentials = {.authentication = {
+                            .certificate = certificate,
+                            .key = private_key,
+                        }}};
 
     mqttClient = esp_mqtt_client_init(&mqtt_cfg);
 
     esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY,
                                    mqtt_event_handler, NULL);
+}
 
-    int scheduleCheckID = -1;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGI(BOOT_TAG, "heap: %d", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        if (pdTICKS_TO_MS(xTaskGetTickCount()) - currentSpriteStartTime >
-            currentSpriteDuration) {
-            if (scheduledSpriteCount == 0) {
-                continue;
-            }
-
-            int tcID = scheduleCheckID;
-            scheduleCheckID++;
-
-            if (scheduleCheckID >= scheduledSpriteCount) {
-                scheduleCheckID = 0;
-                tcID = scheduledSpriteCount - 1;
-            }
-
-            bool currentAppletPinned = scheduledSprites[tcID].pinned;
-            bool skipApplet = scheduledSprites[scheduleCheckID].skipped;
-            int duration = scheduledSprites[scheduleCheckID].duration;
-
-            if (currentAppletPinned) {
-                continue;
-            }
-
-            if (skipApplet) {
-                continue;
-            }
-
-            ESP_LOGI(SCHEDULE_TAG, "showing %d", scheduleCheckID);
-
-            char newAppletName[15];
-            snprintf(newAppletName, 15, "sprites/%d", scheduleCheckID);
-
-            /* show connect_cloud sprite */
-            workerQueueItem workItem = {
-                .type = WORKITEM_TYPE_SHOW_SPRITE,
-            };
-            strcpy(workItem.charParameter, newAppletName);
-            xQueueSend(workerQueue, &workItem, 100);
-
-            currentlyShowingSprite = scheduleCheckID;
-            currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
-            currentSpriteDuration =
-                scheduledSprites[currentlyShowingSprite].duration * 1000;
-        }
+void showNextApplet() {
+    currentlyShowingApplet++;
+    if (currentlyShowingApplet >= scheduledAppletCount) {
+        currentlyShowingApplet = 0;
     }
+    char newAppletName[3];
+    snprintf(newAppletName, 3, "%d", currentlyShowingApplet);
+
+    /* show connect_cloud applet */
+    showApplet(newAppletName);
+    char resp[200];
+    snprintf(resp, 200,
+             "{\"type\":\"success\",\"info\":\"applet_displayed\","
+             "\"appid\":%s}",
+             newAppletName);
+    esp_mqtt_client_publish(mqttClient, statusTopic, resp, 0, 1, 0);
+    currentAppletStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
+}
+
+void showApplet(const char *name) {
+    char fileName[40];
+    snprintf(fileName, 40, "/littlefs/%s.webp", name);
+    FILE *f = fopen(fileName, "r");
+    if (f == NULL) {
+        ESP_LOGW("smx/dec", "couldn't find applet %s", fileName);
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size_t fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_NOT_READY,
+                eSetValueWithOverwrite);
+
+    WebPDataClear(&webPData);
+
+    webPData.bytes = (uint8_t *)WebPMalloc(fileSize);
+    webPData.size = fileSize;
+
+    fread((void *)webPData.bytes, 1, fileSize, f);
+    fclose(f);
+
+    xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY, eSetValueWithOverwrite);
+}
+
+void startProvisioner() {
+    /* Configuration for the provisioning manager */
+    wifi_prov_mgr_config_t config = {
+        .scheme = wifi_prov_scheme_ble,
+        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+    /* Initialize provisioning manager with the
+     * configuration parameters set above */
+    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+
+    char service_name[18];
+    uint8_t eth_mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
+    snprintf(service_name, 18, "%s%02X%02X%02X%02X%02X%02X", "PROV_",
+             eth_mac[0], eth_mac[1], eth_mac[2], eth_mac[3], eth_mac[4],
+             eth_mac[5]);
+
+    /* Start provisioning service */
+    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL,
+                                                     service_name, NULL));
 }
