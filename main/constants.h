@@ -3,6 +3,8 @@
 
 #include <stdio.h>
 
+#define MFG_PARTITION_NAME "mfg_data"
+
 /* Logger tags */
 #define PROV_TAG "[smx/provisioner]"
 #define BOOT_TAG "[smx/boot]"

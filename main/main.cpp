@@ -10,6 +10,7 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <freertos/timers.h>
+#include <lwip/ip4_addr.h>
 #include <mqtt_client.h>
 #include <nvs_flash.h>
 #include <stdio.h>
@@ -124,7 +125,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 }
             } else {
-                //we should not get here!
+                // we should not get here!
                 ESP_LOGE(MQTT_TAG, "unknown focus!");
                 esp_restart();
             }
@@ -190,9 +191,9 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                     } else {
                         ESP_LOGI(PROV_TAG, "not provisioned!");
 
-                        workItem newWorkItem;
-                        newWorkItem.workItemType = WORKITEM_TYPE_START_PROVISIONER;
-                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                        wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble, .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+                        ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+                        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
                     }
                 }
                 break;
@@ -205,9 +206,9 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                     ESP_LOGI(WIFI_TAG, "failure count (5) reached.");
                     provisioning = true;
 
-                    workItem newWorkItem;
-                    newWorkItem.workItemType = WORKITEM_TYPE_START_PROVISIONER;
-                    xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble, .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+                    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+                    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
                 }
                 ESP_LOGI(WIFI_TAG, "STA reconnecting..");
                 esp_wifi_connect();
@@ -228,8 +229,11 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             char *certificate = nullptr;
 
             /* Get TLS client credentials from NVS */
+
+            nvs_flash_init_partition(MFG_PARTITION_NAME);
+
             nvs_handle handle;
-            nvs_open("certs", NVS_READONLY, &handle);
+            nvs_open_from_partition(MFG_PARTITION_NAME, "certs", NVS_READONLY, &handle);
 
             private_key = nvs_load_value_if_exist(handle, "client_key");
             certificate = nvs_load_value_if_exist(handle, "client_cert");
@@ -374,11 +378,6 @@ void Worker_Task(void *arg) {
                     } else {
                         ESP_LOGE(WORKER_TAG, "couldn't find file %s", filePath);
                     }
-                } else if (currentWorkItem.workItemType == WORKITEM_TYPE_START_PROVISIONER) {
-                    ESP_LOGD(WORKER_TAG, "reached prov start request handler..");
-                    wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble, .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
-                    ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
-                    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
                 }
             }
         }
@@ -390,9 +389,10 @@ void Matrix_Task(void *arg) {
     unsigned long animStartTS = 0;
     int lastFrameTimestamp = 0;
     int currentFrame = 0;
+    uint32_t notifiedValue;
+    uint8_t *buf;
 
     while (1) {
-        uint32_t notifiedValue;
         if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(30))) {
             if (notifiedValue == MATRIX_TASK_NOTIF_NOT_READY) {
                 ESP_LOGI(MATRIX_TAG, "we are not ready to decode");
@@ -421,7 +421,6 @@ void Matrix_Task(void *arg) {
 
                 bool hasMoreFrames = WebPAnimDecoderHasMoreFrames(dec);
                 if (hasMoreFrames) {
-                    uint8_t *buf;
                     if (WebPAnimDecoderGetNext(dec, &buf, &lastFrameTimestamp)) {
                         int px = 0;
                         for (int y = 0; y < MATRIX_HEIGHT; y++) {
@@ -455,7 +454,7 @@ void Schedule_Task(void *arg) {
     }
 
     while (1) {
-        //not done yet lmao
+        // not done yet lmao
         vTaskDelay(portMAX_DELAY);
     }
 }
@@ -489,7 +488,7 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 5000, NULL, 5, &workerTask, 1);
-    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 5, &matrixTask, 1);
+    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
 
     workItem newWorkItem;
