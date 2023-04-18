@@ -367,7 +367,7 @@ void Worker_Task(void *arg) {
                         // Show!
                         if (strncmp((const char *)webPData.bytes, "RIFF", 4) == 0) {
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY, eSetValueWithOverwrite);
-                            ESP_LOGE(WORKER_TAG, "showing sprite %s", currentWorkItem.workItemString);
+                            ESP_LOGI(WORKER_TAG, "showing sprite %s", currentWorkItem.workItemString);
                         } else {
                             ESP_LOGE(WORKER_TAG, "file %s has invalid header!", filePath);
                         }
