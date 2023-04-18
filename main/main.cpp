@@ -4,6 +4,7 @@
 #include <esp_event.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -18,23 +19,36 @@
 #include <wifi_provisioning/scheme_ble.h>
 
 #include "constants.h"
-#include "pins.h"
 
 WebPData webPData;
 esp_mqtt_client_handle_t mqttClient;
 
 WebPAnimDecoder *dec = nullptr;
-char *private_key = nullptr;
-char *certificate = nullptr;
 
-char device_id[7];
 char thing_name[18];
 char jsonBuf[8192];
 static scheduledItem *scheduledItems = new scheduledItem[100];
 
 QueueHandle_t xWorkerQueue;
-TaskHandle_t workerTask, matrixTask;
+TaskHandle_t workerTask, matrixTask, scheduleTask;
 MatrixPanel_I2S_DMA *matrix;
+
+char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
+    // Try to get the size of the item
+    size_t value_size;
+    if (nvs_get_str(handle, key, NULL, &value_size) != ESP_OK) {
+        ESP_LOGE(BOOT_TAG, "Failed to get size of key: %s", key);
+        return NULL;
+    }
+
+    char *value = (char *)malloc(value_size);
+    if (nvs_get_str(handle, key, value, &value_size) != ESP_OK) {
+        ESP_LOGE(BOOT_TAG, "Failed to load key: %s", key);
+        return NULL;
+    }
+
+    return value;
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -54,7 +68,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             sprintf(tmpTopic, "$aws/things/%s/shadow/update/delta", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
-            // Request initial shadow
+            // Request to get the initial shadow state
             sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
             esp_mqtt_client_publish(event->client, tmpTopic, "{}", 0, 0, false);
             break;
@@ -73,7 +87,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (strstr(lastTopic, "shadow") != NULL) {
                 if (strstr(lastTopic, "get") != NULL) {
                     if (strstr(lastTopic, "accepted") != NULL) {
-                        // We received a shadow from AWS
+                        // We've received a FULL desired shadow from AWS (type=get)
                         if (event->current_data_offset == 0) {
                             memset(jsonBuf, 0, sizeof(jsonBuf));
                         }
@@ -86,7 +100,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                         }
                     } else if (strstr(lastTopic, "rejected") != NULL) {
-                        // AWS rejected our get shadow request, generate and post the state.
+                        // AWS rejected our get shadow request, generate and post the reported state.
                         ESP_LOGE(MQTT_TAG, "couldn't fetch shadow, creating one");
 
                         workItem newWorkItem;
@@ -95,7 +109,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 } else if (strstr(lastTopic, "update") != NULL) {
                     if (strstr(lastTopic, "delta") != NULL) {
-                        // We've received a change to our shadow
+                        // We've received a DELTA change to our desired shadow (type=delta)
                         if (event->current_data_offset == 0) {
                             memset(jsonBuf, 0, sizeof(jsonBuf));
                         }
@@ -110,7 +124,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 }
             } else {
+                //we should not get here!
                 ESP_LOGE(MQTT_TAG, "unknown focus!");
+                esp_restart();
             }
             break;
         default:
@@ -168,11 +184,11 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                     }
 
                     if (provisioned) {
-                        ESP_LOGI(WIFI_TAG, "already provisioned, connecting..");
+                        ESP_LOGI(PROV_TAG, "provisioned!");
                         provisioning = false;
                         esp_wifi_connect();
                     } else {
-                        ESP_LOGI(WIFI_TAG, "not provisioned, starting provisioner..");
+                        ESP_LOGI(PROV_TAG, "not provisioned!");
 
                         workItem newWorkItem;
                         newWorkItem.workItemType = WORKITEM_TYPE_START_PROVISIONER;
@@ -186,7 +202,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                 ESP_LOGI(WIFI_TAG, "STA disconnected");
                 esp_mqtt_client_stop(mqttClient);
                 if (wifiConnectionAttempts > 5 && !provisioning) {
-                    ESP_LOGI(WIFI_TAG, "failure count reached, restarting provisioner..");
+                    ESP_LOGI(WIFI_TAG, "failure count (5) reached.");
                     provisioning = true;
 
                     workItem newWorkItem;
@@ -207,6 +223,23 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
             strcpy(newWorkItem.workItemString, "connect_cloud");
             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+
+            char *private_key = nullptr;
+            char *certificate = nullptr;
+
+            /* Get TLS client credentials from NVS */
+            nvs_handle handle;
+            nvs_open("certs", NVS_READONLY, &handle);
+
+            private_key = nvs_load_value_if_exist(handle, "client_key");
+            certificate = nvs_load_value_if_exist(handle, "client_cert");
+            nvs_close(handle);
+
+            // Check if both items have been correctly retrieved
+            if (private_key == NULL || certificate == NULL) {
+                ESP_LOGE(MQTT_TAG, "Private key and/or cert could not be loaded");
+                esp_restart();
+            }
 
             /* Setup MQTT */
             const esp_mqtt_client_config_t mqtt_cfg = {.broker = {.address = "mqtts://afb1whot34whq-ats.iot.us-east-1.amazonaws.com:8883",
@@ -394,7 +427,6 @@ void Matrix_Task(void *arg) {
                         for (int y = 0; y < MATRIX_HEIGHT; y++) {
                             for (int x = 0; x < MATRIX_WIDTH; x++) {
                                 matrix->drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
-
                                 px++;
                             }
                         }
@@ -404,7 +436,7 @@ void Matrix_Task(void *arg) {
                             WebPAnimDecoderReset(dec);
                         }
                     } else {
-                        ESP_LOGI(MATRIX_TAG, "we cannot get the next frame!");
+                        ESP_LOGE(MATRIX_TAG, "we cannot get the next frame!");
                         isReady = false;
                     }
                 }
@@ -413,24 +445,8 @@ void Matrix_Task(void *arg) {
     }
 }
 
-char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
-    // Try to get the size of the item
-    size_t value_size;
-    if (nvs_get_str(handle, key, NULL, &value_size) != ESP_OK) {
-        ESP_LOGE(BOOT_TAG, "Failed to get size of key: %s", key);
-        return NULL;
-    }
-
-    char *value = (char *)malloc(value_size);
-    if (nvs_get_str(handle, key, value, &value_size) != ESP_OK) {
-        ESP_LOGE(BOOT_TAG, "Failed to load key: %s", key);
-        return NULL;
-    }
-
-    return value;
-}
-
-extern "C" void app_main(void) {
+void Schedule_Task(void *arg) {
+    /* Initialize the scheduler items */
     for (int i = 0; i < 100; i++) {
         scheduledItems[i].show_duration = 0;
         scheduledItems[i].is_pinned = false;
@@ -438,7 +454,15 @@ extern "C" void app_main(void) {
         strcpy(scheduledItems[i].data_md5, "");
     }
 
-    HUB75_I2S_CFG::i2s_pins _pins = {35,37,36,34,9,8,7,6,21,5,-1,4,2,1};
+    while (1) {
+        //not done yet lmao
+        vTaskDelay(portMAX_DELAY);
+    }
+}
+
+extern "C" void app_main(void) {
+    /* Start the matrix */
+    HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
     HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
     matrix = new MatrixPanel_I2S_DMA(mxconfig);
     matrix->begin();
@@ -464,21 +488,9 @@ extern "C" void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 
-    nvs_handle handle;
-    nvs_open("certs", NVS_READONLY, &handle);
-
-    private_key = nvs_load_value_if_exist(handle, "client_key");
-    certificate = nvs_load_value_if_exist(handle, "client_cert");
-    nvs_close(handle);
-
-    // Check if both items have been correctly retrieved
-    if (private_key == NULL || certificate == NULL) {
-        ESP_LOGE(BOOT_TAG, "Private key and/or cert could not be loaded");
-        return;
-    }
-
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 5000, NULL, 5, &workerTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 5, &matrixTask, 1);
+    xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
 
     workItem newWorkItem;
     newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
@@ -512,6 +524,7 @@ extern "C" void app_main(void) {
     dns_info2.ip.u_addr.ip4.addr = dns_server_ip2.addr;
     esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns_info2);
 
+    char device_id[7];
     uint8_t eth_mac[6];
     esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
     snprintf(device_id, 7, "%02X%02X%02X", eth_mac[3], eth_mac[4], eth_mac[5]);
