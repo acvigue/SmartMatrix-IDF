@@ -34,6 +34,7 @@ static scheduledItem *scheduledItems = new scheduledItem[100];
 
 QueueHandle_t xWorkerQueue;
 TaskHandle_t workerTask, matrixTask;
+MatrixPanel_I2S_DMA *matrix;
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -357,11 +358,6 @@ void Matrix_Task(void *arg) {
     int lastFrameTimestamp = 0;
     int currentFrame = 0;
 
-    HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
-    HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
-    MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
-    matrix.begin();
-
     while (1) {
         uint32_t notifiedValue;
         if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(30))) {
@@ -397,7 +393,7 @@ void Matrix_Task(void *arg) {
                         int px = 0;
                         for (int y = 0; y < MATRIX_HEIGHT; y++) {
                             for (int x = 0; x < MATRIX_WIDTH; x++) {
-                                matrix.drawPixel(x, y, matrix.color565(buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]));
+                                matrix->drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
 
                                 px++;
                             }
@@ -442,6 +438,11 @@ extern "C" void app_main(void) {
         strcpy(scheduledItems[i].data_md5, "");
     }
 
+    HUB75_I2S_CFG::i2s_pins _pins = {35,37,36,34,9,8,7,6,21,5,-1,4,2,1};
+    HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
+    matrix = new MatrixPanel_I2S_DMA(mxconfig);
+    matrix->begin();
+
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -455,7 +456,6 @@ extern "C" void app_main(void) {
         return;
     }
 
-    /* Initialize LittleFS */
     esp_vfs_littlefs_conf_t conf = {
         .base_path = "/fs",
         .partition_label = "littlefs",
@@ -477,27 +477,22 @@ extern "C" void app_main(void) {
         return;
     }
 
-    xTaskCreatePinnedToCore(Worker_Task, "WorkerTask1", 10000, NULL, 5, &workerTask, 1);
-    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 10000, NULL, 5, &matrixTask, 1);
+    xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 5000, NULL, 5, &workerTask, 1);
+    xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 3500, NULL, 5, &matrixTask, 1);
 
-    /* show boot applet */
     workItem newWorkItem;
     newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
     strcpy(newWorkItem.workItemString, "connect_wifi");
     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
-    /* Initialize TCP/IP */
     ESP_ERROR_CHECK(esp_netif_init());
 
-    /* Initialize the event loop */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
 
-    /* Initialize WiFi, this will start the provisioner/mqtt client as
-     * necessary */
     esp_netif_t *netif = esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
