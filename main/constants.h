@@ -30,7 +30,7 @@ enum WorkItemType {
     GOT_STREAM_DESCRIPTION,
     REQUEST_STREAM_CHUNK,
     PROCESS_STREAM_CHUNK,
-    HANDLE_COMPLETE_STREAM_DATA
+    HANDLE_COMPLETE_STREAM_DATA,
 };
 
 enum IoTJobOperation { SPRITE_DELIVERY, OTA_UPDATE };
@@ -56,12 +56,11 @@ typedef struct scheduledItem {
     int show_duration;
     bool is_pinned;
     bool is_skipped;
-    char data_md5[33];
 } scheduledItem;
 
 typedef struct workItem {
     WorkItemType workItemType;
-    char workItemString[8192];
+    char workItemString[1500];
     int workItemInteger;
 } workItem;
 

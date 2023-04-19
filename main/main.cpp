@@ -306,11 +306,11 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
 void Worker_Task(void *arg) {
     workItem currentWorkItem;
-    char currentExecutingJobID[65];
     uint8_t *currentStreamTemporaryBuffer = nullptr;
     int currentStreamBufferPos = 0;
     char currentStreamID[129];
     bool streamStarted = false;
+    char currentJobDocument[500];
 
     while (1) {
         if (xWorkerQueue != NULL) {
@@ -337,7 +337,6 @@ void Worker_Task(void *arg) {
                         scheduledItems[i].show_duration = itemDuration;
                         scheduledItems[i].is_pinned = itemPinned;
                         scheduledItems[i].is_skipped = itemSkipped;
-                        strcpy(scheduledItems[i].data_md5, cJSON_GetObjectItem(item, "hash")->valuestring);
                     }
                     scheduledItems[itemCount].show_duration = 0;
 
@@ -362,11 +361,10 @@ void Worker_Task(void *arg) {
                         cJSON_AddItemToObject(scheduleItem, "duration", cJSON_CreateNumber(scheduledItems[i].show_duration));
                         cJSON_AddItemToObject(scheduleItem, "skipped", cJSON_CreateBool(scheduledItems[i].is_skipped));
                         cJSON_AddItemToObject(scheduleItem, "pinned", cJSON_CreateBool(scheduledItems[i].is_pinned));
-                        cJSON_AddItemToObject(scheduleItem, "hash", cJSON_CreateString(scheduledItems[i].data_md5));
                     }
 
                     char *string = NULL;
-                    string = cJSON_Print(state);
+                    string = cJSON_PrintUnformatted(state);
                     cJSON_Delete(state);
 
                     char *fullUpdateState = (char *)malloc(8192);
@@ -414,16 +412,13 @@ void Worker_Task(void *arg) {
                     cJSON *jobNotifyNextDoc = cJSON_Parse(jsonBuf);
                     cJSON *execution = cJSON_GetObjectItem(jobNotifyNextDoc, "execution");
 
-                    // Store job ID
-                    strcpy(currentExecutingJobID, cJSON_GetObjectItem(execution, "jobId")->valuestring);
-                    ESP_LOGI(WORKER_TAG, "job ID: %s", currentExecutingJobID);
+                    ESP_LOGI(WORKER_TAG, "job ID: %s", cJSON_GetObjectItem(execution, "jobId")->valuestring);
 
                     cJSON *jobDocument = cJSON_GetObjectItem(execution, "jobDocument");
                     IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobDocument, "operation")->valueint;
 
                     workItem newWorkItem;
                     newWorkItem.workItemType = WorkItemType::START_JOB_EXECUTION;
-                    newWorkItem.workItemInteger = operation;
                     strcpy(newWorkItem.workItemString, jsonBuf);
                     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
@@ -441,16 +436,17 @@ void Worker_Task(void *arg) {
                     sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
 
-                    IoTJobOperation operation = (IoTJobOperation)currentWorkItem.workItemInteger;
+                    strcpy(currentJobDocument, currentWorkItem.workItemString);
+                    cJSON *jobDocument = cJSON_GetObjectItem(execution, "jobDocument");
+                    IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobDocument, "operation")->valueint;
+
                     ESP_LOGI(WORKER_TAG, "... of type %d", operation);
                     if (operation == IoTJobOperation::SPRITE_DELIVERY) {
                         // jobDocument has (spriteID: int, streamID: string (128))
-                        cJSON *jobDocument = cJSON_GetObjectItem(execution, "jobDocument");
-                        int deliveringSpriteID = cJSON_GetObjectItem(jobDocument, "spriteID")->valueint;
                         strcpy(currentStreamID, cJSON_GetObjectItem(jobDocument, "streamID")->valuestring);
 
                         // start the streaming process by requesting the stream.
-                        sprintf(tmpTopic, "$aws/things/%s/streams/%s/describe/json", thing_name, currentStreamID);
+                        snprintf(tmpTopic, 100, "$aws/things/%s/streams/%s/describe/json", thing_name, currentStreamID);
                         ESP_LOGI(WORKER_TAG, "requesting the stream description (%s)", tmpTopic);
                         esp_mqtt_client_publish(mqttClient, tmpTopic, "{}", 0, 0, false);
                     }
@@ -480,7 +476,6 @@ void Worker_Task(void *arg) {
                         newWorkItem.workItemType = WorkItemType::REQUEST_STREAM_CHUNK;
                         newWorkItem.workItemInteger = 0;
                         xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-
                         cJSON_Delete(streamDescriptionDoc);
                     }
                 } else if (currentWorkItem.workItemType == WorkItemType::REQUEST_STREAM_CHUNK) {
@@ -489,7 +484,7 @@ void Worker_Task(void *arg) {
 
                     char resp[100];
                     sprintf(resp, "{\"f\":0,\"l\":%d,\"o\":%d,\"n\":1}", STREAM_CHUNK_SIZE, blockNo);
-                    sprintf(tmpTopic, "$aws/things/%s/streams/%s/get/json", thing_name, currentStreamID);
+                    snprintf(tmpTopic, 100, "$aws/things/%s/streams/%s/get/json", thing_name, currentStreamID);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                     ESP_LOGI(WORKER_TAG, "... published %s to %s", resp, tmpTopic);
                 } else if (currentWorkItem.workItemType == WorkItemType::PROCESS_STREAM_CHUNK) {
@@ -521,20 +516,77 @@ void Worker_Task(void *arg) {
 
                     if (blockLen < STREAM_CHUNK_SIZE) {
                         // we're done, that was the last block
+                        ESP_LOGI(WORKER_TAG, "was the last block!");
                         workItem newWorkItem;
                         newWorkItem.workItemType = WorkItemType::HANDLE_COMPLETE_STREAM_DATA;
-                        strcpy(newWorkItem.workItemString, jsonBuf);
                         xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                     } else {
                         // more blocks needed to recreate the file.. request another
+                        ESP_LOGI(WORKER_TAG, "requesting the next block, %d", blockID + 1);
                         workItem newWorkItem;
                         newWorkItem.workItemType = WorkItemType::REQUEST_STREAM_CHUNK;
                         newWorkItem.workItemInteger = blockID + 1;
-                        strcpy(newWorkItem.workItemString, jsonBuf);
                         xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                     }
 
                     cJSON_Delete(streamDataDoc);
+                } else if (currentWorkItem.workItemType == WorkItemType::HANDLE_COMPLETE_STREAM_DATA) {
+                    // The current job document *should* still be in currentJobDocument
+                    ESP_LOGI(WORKER_TAG, "stream data is decoded, let's handle it");
+                    cJSON *jobDoc = cJSON_Parse(currentJobDocument);
+                    cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
+                    cJSON *jobDocument = cJSON_GetObjectItem(execution, "jobDocument");
+                    IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobDocument, "operation")->valueint;
+
+                    ESP_LOGI(WORKER_TAG, "original calling job had type %d", operation);
+                    if (operation == IoTJobOperation::SPRITE_DELIVERY) {
+                        // jobDocument has (spriteID: int, streamID: string (128))
+                        int deliveringSpriteID = cJSON_GetObjectItem(jobDocument, "spriteID")->valueint;
+
+                        ESP_LOGI(WORKER_TAG, ".. sprite delivery for %d!", deliveringSpriteID);
+
+                        char filePath[40];
+                        snprintf(filePath, 40, "/fs/%d.webp", deliveringSpriteID);
+                        struct stat st;
+                        if (stat(filePath, &st) == 0) {
+                            unlink(filePath);
+                        }
+
+                        ESP_LOGI(WORKER_TAG, "opening %s for writing", filePath);
+                        FILE *f = fopen(filePath, "w");
+                        if (f != NULL) {
+                            fwrite(currentStreamTemporaryBuffer, 1, currentStreamBufferPos, f);
+                            fclose(f);
+                            ESP_LOGI(WORKER_TAG, "wrote %d bytes", currentStreamBufferPos);
+                        } else {
+                            ESP_LOGE(WORKER_TAG, "couldn't open %s for writing!", filePath);
+                        }
+
+                        // this job is complete, we can mark it
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::MARK_JOB_COMPLETE;
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    }
+
+                    free(currentStreamTemporaryBuffer);
+                    streamStarted = false;
+
+                    cJSON_Delete(jobDoc);
+                } else if (currentWorkItem.workItemType == WorkItemType::MARK_JOB_COMPLETE) {
+                    // The current job document *should* still be in currentJobDocument
+                    ESP_LOGI(WORKER_TAG, "marking job complete");
+                    cJSON *jobDoc = cJSON_Parse(currentJobDocument);
+                    cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
+
+                    const char *jobID = cJSON_GetObjectItem(execution, "jobId")->valuestring;
+                    ESP_LOGI(WORKER_TAG, "... for job %s", jobID);
+                    const char *resp = "{\"status\":\"SUCCEEDED\", \"expectedVersion\": \"1\"}";
+
+                    sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
+                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+
+                    strcpy(currentJobDocument, "");
+                    cJSON_Delete(jobDoc);
                 }
             }
         }
@@ -607,7 +659,6 @@ void Schedule_Task(void *arg) {
         scheduledItems[i].show_duration = 0;
         scheduledItems[i].is_pinned = false;
         scheduledItems[i].is_skipped = false;
-        strcpy(scheduledItems[i].data_md5, "");
     }
 
     while (1) {
@@ -644,7 +695,7 @@ extern "C" void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 
-    xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 5000, NULL, 5, &workerTask, 1);
+    xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 10000, NULL, 5, &workerTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
 
