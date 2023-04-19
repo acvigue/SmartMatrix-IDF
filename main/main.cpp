@@ -246,7 +246,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             }
 
             /* Setup MQTT */
-            const esp_mqtt_client_config_t mqtt_cfg = {.broker = {.address = "mqtts://afb1whot34whq-ats.iot.us-east-1.amazonaws.com:8883",
+            const esp_mqtt_client_config_t mqtt_cfg = {.broker = {.address = "mqtts://a2o3d87gplncoj-ats.iot.us-east-1.amazonaws.com:8883",
                                                                   .verification =
                                                                       {
                                                                           .crt_bundle_attach = esp_crt_bundle_attach,
