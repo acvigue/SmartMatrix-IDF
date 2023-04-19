@@ -11,6 +11,7 @@
 #include <freertos/task.h>
 #include <freertos/timers.h>
 #include <lwip/ip4_addr.h>
+#include <mbedtls/base64.h>
 #include <mqtt_client.h>
 #include <nvs_flash.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@ WebPAnimDecoder *dec = nullptr;
 
 char thing_name[18];
 char jsonBuf[8192];
+char tmpTopic[100];
 static scheduledItem *scheduledItems = new scheduledItem[100];
 
 QueueHandle_t xWorkerQueue;
@@ -55,7 +57,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     static char lastTopic[100];
     static int failureCount = 0;
-    char tmpTopic[100];
+
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(MQTT_TAG, "connected to iot core..");
@@ -67,6 +69,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             sprintf(tmpTopic, "$aws/things/%s/shadow/get/rejected", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
             sprintf(tmpTopic, "$aws/things/%s/shadow/update/delta", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+
+            // Job topics
+            sprintf(tmpTopic, "$aws/things/%s/jobs/notify-next", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+            sprintf(tmpTopic, "$aws/things/%s/jobs/get/rejected", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+            sprintf(tmpTopic, "$aws/things/%s/jobs/get/accepted", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+
+            // Stream topics
+            sprintf(tmpTopic, "$aws/things/%s/streams/+/data/json", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+            sprintf(tmpTopic, "$aws/things/%s/streams/+/description/json", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
             // Request to get the initial shadow state
@@ -85,49 +101,61 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 strcpy(lastTopic, event->topic);
             }
 
-            if (strstr(lastTopic, "shadow") != NULL) {
-                if (strstr(lastTopic, "get") != NULL) {
-                    if (strstr(lastTopic, "accepted") != NULL) {
-                        // We've received a FULL desired shadow from AWS (type=get)
-                        if (event->current_data_offset == 0) {
-                            memset(jsonBuf, 0, sizeof(jsonBuf));
-                        }
+            // fill buffer
+            if (event->current_data_offset == 0) {
+                memset(jsonBuf, 0, sizeof(jsonBuf));
+            }
 
-                        memcpy((void *)(jsonBuf + event->current_data_offset), event->data, event->data_len);
-                        if (event->data_len + event->current_data_offset >= event->total_data_len) {
+            memcpy((void *)(jsonBuf + event->current_data_offset), event->data, event->data_len);
+            if (event->data_len + event->current_data_offset >= event->total_data_len) {
+                if (strstr(lastTopic, "shadow") != NULL) {
+                    if (strstr(lastTopic, "get") != NULL) {
+                        if (strstr(lastTopic, "accepted") != NULL) {
                             workItem newWorkItem;
-                            newWorkItem.workItemType = WORKITEM_TYPE_HANDLE_DESIRED_SHADOW_UPDATE;
+                            newWorkItem.workItemType = WorkItemType::HANDLE_DESIRED_SHADOW_UPDATE;
                             strcpy(newWorkItem.workItemString, "get");
                             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                        }
-                    } else if (strstr(lastTopic, "rejected") != NULL) {
-                        // AWS rejected our get shadow request, generate and post the reported state.
-                        ESP_LOGE(MQTT_TAG, "couldn't fetch shadow, creating one");
+                        } else if (strstr(lastTopic, "rejected") != NULL) {
+                            // AWS rejected our get shadow request, generate and post the reported state.
+                            ESP_LOGE(MQTT_TAG, "couldn't fetch shadow, creating one");
 
-                        workItem newWorkItem;
-                        newWorkItem.workItemType = WORKITEM_TYPE_UPDATE_REPORTED_SHADOW;
-                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                    }
-                } else if (strstr(lastTopic, "update") != NULL) {
-                    if (strstr(lastTopic, "delta") != NULL) {
-                        // We've received a DELTA change to our desired shadow (type=delta)
-                        if (event->current_data_offset == 0) {
-                            memset(jsonBuf, 0, sizeof(jsonBuf));
-                        }
-
-                        memcpy((void *)(jsonBuf + event->current_data_offset), event->data, event->data_len);
-                        if (event->data_len + event->current_data_offset >= event->total_data_len) {
                             workItem newWorkItem;
-                            newWorkItem.workItemType = WORKITEM_TYPE_HANDLE_DESIRED_SHADOW_UPDATE;
+                            newWorkItem.workItemType = WorkItemType::UPDATE_REPORTED_SHADOW;
+                            xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                        }
+                    } else if (strstr(lastTopic, "update") != NULL) {
+                        if (strstr(lastTopic, "delta") != NULL) {
+                            // We've received a DELTA change to our desired shadow (type=delta)
+                            workItem newWorkItem;
+                            newWorkItem.workItemType = WorkItemType::HANDLE_DESIRED_SHADOW_UPDATE;
                             strcpy(newWorkItem.workItemString, "delta");
                             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                         }
                     }
+                } else if (strstr(lastTopic, "jobs") != NULL) {
+                    if (strstr(lastTopic, "notify-next") != NULL) {
+                        // we got a new job notification
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::GOT_NEW_JOB;
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    }
+                } else if (strstr(lastTopic, "streams") != NULL) {
+                    if (strstr(lastTopic, "description") != NULL) {
+                        // we got a stream description
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::GOT_STREAM_DESCRIPTION;
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    } else if (strstr(lastTopic, "data") != NULL) {
+                        // we got a stream block
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::PROCESS_STREAM_CHUNK;
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    }
+                } else {
+                    // we should not get here!
+                    ESP_LOGE(MQTT_TAG, "unknown focus!");
+                    esp_restart();
                 }
-            } else {
-                // we should not get here!
-                ESP_LOGE(MQTT_TAG, "unknown focus!");
-                esp_restart();
             }
             break;
         default:
@@ -159,7 +187,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                 provisioning = true;
                 ESP_LOGI(PROV_TAG, "provisioning started");
                 workItem newWorkItem;
-                newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "setup");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 break;
@@ -170,7 +198,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                 ESP_LOGI(WIFI_TAG, "STA started");
 
                 workItem newWorkItem;
-                newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "connect_wifi");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
@@ -191,7 +219,8 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                     } else {
                         ESP_LOGI(PROV_TAG, "not provisioned!");
 
-                        wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble, .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+                        wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble,
+                                                         .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
                         ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
                         ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
                     }
@@ -206,7 +235,8 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                     ESP_LOGI(WIFI_TAG, "failure count (5) reached.");
                     provisioning = true;
 
-                    wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble, .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+                    wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble,
+                                                     .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
                     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
                     ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
                 }
@@ -221,7 +251,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             ESP_LOGI(WIFI_TAG, "STA connected!");
 
             workItem newWorkItem;
-            newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
+            newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
             strcpy(newWorkItem.workItemString, "connect_cloud");
             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
@@ -276,10 +306,16 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
 void Worker_Task(void *arg) {
     workItem currentWorkItem;
+    char currentExecutingJobID[65];
+    uint8_t *currentStreamTemporaryBuffer = nullptr;
+    int currentStreamBufferPos = 0;
+    char currentStreamID[129];
+    bool streamStarted = false;
+
     while (1) {
         if (xWorkerQueue != NULL) {
             if (xQueueReceive(xWorkerQueue, &(currentWorkItem), pdMS_TO_TICKS(1000)) == pdPASS) {
-                if (currentWorkItem.workItemType == WORKITEM_TYPE_HANDLE_DESIRED_SHADOW_UPDATE) {
+                if (currentWorkItem.workItemType == WorkItemType::HANDLE_DESIRED_SHADOW_UPDATE) {
                     ESP_LOGI(WORKER_TAG, "parsing desired shadow");
                     cJSON *shadowDoc = cJSON_Parse(jsonBuf);
                     cJSON *state = cJSON_GetObjectItem(shadowDoc, "state");
@@ -290,9 +326,6 @@ void Worker_Task(void *arg) {
                         schedule = cJSON_GetObjectItem(desired, "schedule");
                     } else if (strstr(currentWorkItem.workItemString, "delta") != NULL) {
                         schedule = cJSON_GetObjectItem(state, "schedule");
-                    } else {
-                        ESP_LOGE(WORKER_TAG, "can't process shadow update request with invalid context %s", currentWorkItem.workItemString);
-                        continue;
                     }
 
                     int itemCount = cJSON_GetArraySize(schedule);
@@ -308,12 +341,12 @@ void Worker_Task(void *arg) {
                     }
                     scheduledItems[itemCount].show_duration = 0;
 
-                    cJSON_Delete(shadowDoc);
-
                     workItem newWorkItem;
-                    newWorkItem.workItemType = WORKITEM_TYPE_UPDATE_REPORTED_SHADOW;
+                    newWorkItem.workItemType = WorkItemType::UPDATE_REPORTED_SHADOW;
                     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                } else if (currentWorkItem.workItemType == WORKITEM_TYPE_UPDATE_REPORTED_SHADOW) {
+
+                    cJSON_Delete(shadowDoc);
+                } else if (currentWorkItem.workItemType == WorkItemType::UPDATE_REPORTED_SHADOW) {
                     ESP_LOGI(WORKER_TAG, "updating reported shadow");
                     cJSON *state = cJSON_CreateObject();
                     cJSON *schedule = cJSON_CreateArray();
@@ -323,7 +356,6 @@ void Worker_Task(void *arg) {
                         if (scheduledItems[i].show_duration == 0) {
                             break;
                         }
-                        ESP_LOGD(WORKER_TAG, "generating schedule item %d: %d, %s", i, scheduledItems[i].show_duration, scheduledItems[i].data_md5);
                         cJSON *scheduleItem = cJSON_CreateObject();
                         cJSON_AddItemToArray(schedule, scheduleItem);
 
@@ -337,14 +369,13 @@ void Worker_Task(void *arg) {
                     string = cJSON_Print(state);
                     cJSON_Delete(state);
 
-                    char tmpTopic[100];
                     char *fullUpdateState = (char *)malloc(8192);
                     snprintf(fullUpdateState, 8192, "{\"state\":{\"reported\":%s}}", string);
                     sprintf(tmpTopic, "$aws/things/%s/shadow/update", thing_name);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, fullUpdateState, 0, 0, false);
                     free(fullUpdateState);
                     free(string);
-                } else if (currentWorkItem.workItemType == WORKITEM_TYPE_SHOW_SPRITE) {
+                } else if (currentWorkItem.workItemType == WorkItemType::SHOW_SPRITE) {
                     char filePath[40];
                     snprintf(filePath, 40, "/fs/%s.webp", currentWorkItem.workItemString);
                     struct stat st;
@@ -378,6 +409,132 @@ void Worker_Task(void *arg) {
                     } else {
                         ESP_LOGE(WORKER_TAG, "couldn't find file %s", filePath);
                     }
+                } else if (currentWorkItem.workItemType == WorkItemType::GOT_NEW_JOB) {
+                    ESP_LOGI(WORKER_TAG, "we got a new job!");
+                    cJSON *jobNotifyNextDoc = cJSON_Parse(jsonBuf);
+                    cJSON *execution = cJSON_GetObjectItem(jobNotifyNextDoc, "execution");
+
+                    // Store job ID
+                    strcpy(currentExecutingJobID, cJSON_GetObjectItem(execution, "jobId")->valuestring);
+                    ESP_LOGI(WORKER_TAG, "job ID: %s", currentExecutingJobID);
+
+                    cJSON *jobDocument = cJSON_GetObjectItem(execution, "jobDocument");
+                    IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobDocument, "operation")->valueint;
+
+                    workItem newWorkItem;
+                    newWorkItem.workItemType = WorkItemType::START_JOB_EXECUTION;
+                    newWorkItem.workItemInteger = operation;
+                    strcpy(newWorkItem.workItemString, jsonBuf);
+                    xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+
+                    cJSON_Delete(jobNotifyNextDoc);
+                } else if (currentWorkItem.workItemType == WorkItemType::START_JOB_EXECUTION) {
+                    ESP_LOGI(WORKER_TAG, "starting job execution");
+                    cJSON *jobDoc = cJSON_Parse(currentWorkItem.workItemString);
+                    cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
+
+                    // Mark the job as in progress, then we can do something w/ the job type (int param)
+                    const char *jobID = cJSON_GetObjectItem(execution, "jobId")->valuestring;
+                    ESP_LOGI(WORKER_TAG, "... for job %s", jobID);
+                    const char *resp = "{\"status\":\"IN_PROGRESS\", \"expectedVersion\": \"0\"}";
+
+                    sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
+                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+
+                    IoTJobOperation operation = (IoTJobOperation)currentWorkItem.workItemInteger;
+                    ESP_LOGI(WORKER_TAG, "... of type %d", operation);
+                    if (operation == IoTJobOperation::SPRITE_DELIVERY) {
+                        // jobDocument has (spriteID: int, streamID: string (128))
+                        cJSON *jobDocument = cJSON_GetObjectItem(execution, "jobDocument");
+                        int deliveringSpriteID = cJSON_GetObjectItem(jobDocument, "spriteID")->valueint;
+                        strcpy(currentStreamID, cJSON_GetObjectItem(jobDocument, "streamID")->valuestring);
+
+                        // start the streaming process by requesting the stream.
+                        sprintf(tmpTopic, "$aws/things/%s/streams/%s/describe/json", thing_name, currentStreamID);
+                        ESP_LOGI(WORKER_TAG, "requesting the stream description (%s)", tmpTopic);
+                        esp_mqtt_client_publish(mqttClient, tmpTopic, "{}", 0, 0, false);
+                    }
+
+                    cJSON_Delete(jobDoc);
+                } else if (currentWorkItem.workItemType == WorkItemType::GOT_STREAM_DESCRIPTION) {
+                    ESP_LOGI(WORKER_TAG, "we got a stream description!");
+                    if (!streamStarted) {
+                        cJSON *streamDescriptionDoc = cJSON_Parse(jsonBuf);
+                        cJSON *streamFiles = cJSON_GetObjectItem(streamDescriptionDoc, "r");
+                        int streamFilesCount = cJSON_GetArraySize(streamFiles);
+                        if (streamFilesCount != 1) {
+                            ESP_LOGE(WORKER_TAG, "stream contained more than 1 file! skipping..");
+                            continue;
+                        }
+                        ESP_LOGI(WORKER_TAG, "contains 1 file...");
+
+                        cJSON *streamFile = cJSON_GetArrayItem(streamFiles, 0);
+                        size_t fileSize = cJSON_GetObjectItem(streamFile, "z")->valueint;
+
+                        ESP_LOGI(WORKER_TAG, "of size %d", fileSize);
+
+                        currentStreamTemporaryBuffer = (uint8_t *)malloc(fileSize);
+                        streamStarted = true;
+
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::REQUEST_STREAM_CHUNK;
+                        newWorkItem.workItemInteger = 0;
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+
+                        cJSON_Delete(streamDescriptionDoc);
+                    }
+                } else if (currentWorkItem.workItemType == WorkItemType::REQUEST_STREAM_CHUNK) {
+                    int blockNo = currentWorkItem.workItemInteger;
+                    ESP_LOGI(WORKER_TAG, "requesting stream chunk no %d", blockNo);
+
+                    char resp[100];
+                    sprintf(resp, "{\"f\":0,\"l\":%d,\"o\":%d,\"n\":1}", STREAM_CHUNK_SIZE, blockNo);
+                    sprintf(tmpTopic, "$aws/things/%s/streams/%s/get/json", thing_name, currentStreamID);
+                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+                    ESP_LOGI(WORKER_TAG, "... published %s to %s", resp, tmpTopic);
+                } else if (currentWorkItem.workItemType == WorkItemType::PROCESS_STREAM_CHUNK) {
+                    ESP_LOGI(WORKER_TAG, "we got a stream chunk!");
+                    cJSON *streamDataDoc = cJSON_Parse(jsonBuf);
+                    size_t blockLen = cJSON_GetObjectItem(streamDataDoc, "l")->valueint;
+                    int blockID = cJSON_GetObjectItem(streamDataDoc, "i")->valueint;
+                    const uint8_t *blockData = (uint8_t *)cJSON_GetObjectItem(streamDataDoc, "p")->valuestring;
+                    ESP_LOGI(WORKER_TAG, "size: %d", blockLen);
+                    ESP_LOGI(WORKER_TAG, "block no: %d", blockID);
+                    ESP_LOGI(WORKER_TAG, "data (b64): %s", blockData);
+
+                    // can we decode here?
+                    size_t decodedChunkSize;
+                    int decoded = mbedtls_base64_decode((currentStreamTemporaryBuffer + currentStreamBufferPos), sizeof(currentStreamTemporaryBuffer),
+                                                        &decodedChunkSize, blockData, blockLen);
+                    if (decoded == 0) {
+                        currentStreamBufferPos = currentStreamBufferPos + decodedChunkSize;
+                        ESP_LOGI(WORKER_TAG, "b64 decoded: %d bytes", decodedChunkSize);
+                    } else {
+                        ESP_LOGE(WORKER_TAG, "b64 decode (size) err: %d", decoded);
+                        esp_restart();
+                    }
+
+                    char *tmpDisplayBuf = (char *)malloc(decodedChunkSize);
+                    memcpy(tmpDisplayBuf, (currentStreamTemporaryBuffer + currentStreamBufferPos), decodedChunkSize);
+                    ESP_LOGI(WORKER_TAG, "decoded data: %s", tmpDisplayBuf);
+                    free(tmpDisplayBuf);
+
+                    if (blockLen < STREAM_CHUNK_SIZE) {
+                        // we're done, that was the last block
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::HANDLE_COMPLETE_STREAM_DATA;
+                        strcpy(newWorkItem.workItemString, jsonBuf);
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    } else {
+                        // more blocks needed to recreate the file.. request another
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::REQUEST_STREAM_CHUNK;
+                        newWorkItem.workItemInteger = blockID + 1;
+                        strcpy(newWorkItem.workItemString, jsonBuf);
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    }
+
+                    cJSON_Delete(streamDataDoc);
                 }
             }
         }
@@ -492,7 +649,7 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
 
     workItem newWorkItem;
-    newWorkItem.workItemType = WORKITEM_TYPE_SHOW_SPRITE;
+    newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
     strcpy(newWorkItem.workItemString, "connect_wifi");
     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
