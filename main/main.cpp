@@ -91,7 +91,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
             esp_mqtt_client_publish(event->client, tmpTopic, "{}", 0, 0, false);
 
-            if(!hasConnected) {
+            // Request to get the next pending job
+            sprintf(tmpTopic, "$aws/things/%s/jobs/$next/get", thing_name);
+            char resp[200];
+            snprintf(resp, 200, "{\"jobId\":\"$next\",\"thingName\":\"%s\"}", thing_name);
+            esp_mqtt_client_publish(event->client, tmpTopic, resp, 0, 0, false);
+
+            if (!hasConnected) {
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "ready");
@@ -336,47 +342,49 @@ void MqttMsg_Task(void *arg) {
                         newWorkItem.workItemType = WorkItemType::UPDATE_REPORTED_SHADOW;
                         xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                     }
-                } else if (strstr(currentMessage.topic, "jobs/notify-next") != NULL) {
-                    cJSON *jobDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
-                    if (cJSON_HasObjectItem(jobDoc, "execution") == false) {
-                        continue;
-                    }
+                } else if (strstr(currentMessage.topic, "jobs") != NULL) {
+                    if (strstr(currentMessage.topic, "notify-next") != NULL || strstr(currentMessage.topic, "get/accepted") != NULL) {
+                        cJSON *jobDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
+                        if (cJSON_HasObjectItem(jobDoc, "execution") == false) {
+                            continue;
+                        }
 
-                    cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
+                        cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
 
-                    const char *status = cJSON_GetObjectItem(execution, "status")->valuestring;
-                    if (strcmp(status, "QUEUED") != 0) {
-                        continue;
-                    }
+                        const char *status = cJSON_GetObjectItem(execution, "status")->valuestring;
+                        if (strcmp(status, "QUEUED") != 0) {
+                            continue;
+                        }
 
-                    ESP_LOGI(MQTT_TASK_TAG, "we got a new job!");
+                        ESP_LOGI(MQTT_TASK_TAG, "we got a new job!");
 
-                    cJSON *jobParameters = cJSON_GetObjectItem(execution, "jobDocument");
-                    IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobParameters, "operation")->valueint;
+                        cJSON *jobParameters = cJSON_GetObjectItem(execution, "jobDocument");
+                        IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobParameters, "operation")->valueint;
 
-                    // Mark the job as in progress, then we can do something w/ the job type (int param)
-                    const char *jobID = cJSON_GetObjectItem(execution, "jobId")->valuestring;
-                    ESP_LOGD(MQTT_TASK_TAG, "with ID %s", jobID);
+                        // Mark the job as in progress, then we can do something w/ the job type (int param)
+                        const char *jobID = cJSON_GetObjectItem(execution, "jobId")->valuestring;
+                        ESP_LOGD(MQTT_TASK_TAG, "with ID %s", jobID);
 
-                    const char *resp = "{\"status\":\"IN_PROGRESS\", \"expectedVersion\": \"1\"}";
-                    sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
-                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-
-                    strncpy(currentJobDocument, currentMessage.pMessage, currentMessage.messageLen);
-                    if (operation == IoTJobOperation::SPRITE_DELIVERY) {
-                        ESP_LOGD(MQTT_TASK_TAG, "it's a sprite delivery");
-                        // jobDocument has (spriteID: int, streamID: string (128))
-                        const char *streamID = cJSON_GetObjectItem(jobParameters, "streamID")->valuestring;
-
-                        // start the streaming process by requesting the stream.
-                        snprintf(tmpTopic, 200, "$aws/things/%s/streams/%s/describe/json", thing_name, streamID);
-                        ESP_LOGD(MQTT_TASK_TAG, "requesting the stream description");
-                        char resp[200];
-                        snprintf(resp, 200, "{\"c\":\"%s\"}", streamID);
+                        const char *resp = "{\"status\":\"IN_PROGRESS\", \"expectedVersion\": \"1\"}";
+                        sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
                         esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-                    }
 
-                    cJSON_Delete(jobDoc);
+                        strncpy(currentJobDocument, currentMessage.pMessage, currentMessage.messageLen);
+                        if (operation == IoTJobOperation::SPRITE_DELIVERY) {
+                            ESP_LOGD(MQTT_TASK_TAG, "it's a sprite delivery");
+                            // jobDocument has (spriteID: int, streamID: string (128))
+                            const char *streamID = cJSON_GetObjectItem(jobParameters, "streamID")->valuestring;
+
+                            // start the streaming process by requesting the stream.
+                            snprintf(tmpTopic, 200, "$aws/things/%s/streams/%s/describe/json", thing_name, streamID);
+                            ESP_LOGD(MQTT_TASK_TAG, "requesting the stream description");
+                            char resp[200];
+                            snprintf(resp, 200, "{\"c\":\"%s\"}", streamID);
+                            esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+                        }
+
+                        cJSON_Delete(jobDoc);
+                    }
                 } else if (strstr(currentMessage.topic, "streams") != NULL) {
                     if (strstr(currentMessage.topic, "description") != NULL) {
                         ESP_LOGD(MQTT_TASK_TAG, "we got a stream description!");
