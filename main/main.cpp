@@ -58,6 +58,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     static char lastTopic[200];
     static int failureCount = 0;
     static char *dataBuf = nullptr;
+    static bool hasConnected = false;
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
@@ -89,6 +90,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // Request to get the initial shadow state
             sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
             esp_mqtt_client_publish(event->client, tmpTopic, "{}", 0, 0, false);
+
+            if(!hasConnected) {
+                workItem newWorkItem;
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                strcpy(newWorkItem.workItemString, "ready");
+                xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                hasConnected = true;
+            }
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
@@ -757,18 +766,6 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(wifi_mode_t::WIFI_MODE_STA));
 
     esp_netif_set_hostname(netif, thing_name);
-
-    esp_netif_dns_info_t dns_info1;
-    ip4_addr_t dns_server_ip1;
-    IP4_ADDR(&dns_server_ip1, 1, 1, 1, 1);
-    dns_info1.ip.u_addr.ip4.addr = dns_server_ip1.addr;
-    esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_info1);
-
-    esp_netif_dns_info_t dns_info2;
-    ip4_addr_t dns_server_ip2;
-    IP4_ADDR(&dns_server_ip2, 1, 0, 0, 1);
-    dns_info2.ip.u_addr.ip4.addr = dns_server_ip2.addr;
-    esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns_info2);
 
     char device_id[7];
     uint8_t eth_mac[6];
