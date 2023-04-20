@@ -10,7 +10,8 @@
 #define BOOT_TAG "[smx/boot]"
 #define WORKER_TAG "[smx/worker]"
 #define MATRIX_TAG "[smx/matrix]"
-#define MQTT_TAG "[smx/mqtt]"
+#define MQTT_TAG "[smx/mqtt_ell]"
+#define MQTT_TASK_TAG "[smx/mqtt_task]"
 #define WIFI_TAG "[smx/wifi]"
 #define HTTP_TAG "[smx/http]"
 #define SCHEDULE_TAG "[smx/schedule]"
@@ -20,16 +21,10 @@
 #define MATRIX_TASK_NOTIF_NOT_READY 2
 
 enum WorkItemType {
-    START_PROVISIONER,
     SHOW_SPRITE,
     UPDATE_REPORTED_SHADOW,
-    HANDLE_DESIRED_SHADOW_UPDATE,
-    GOT_NEW_JOB,
-    START_JOB_EXECUTION,
     MARK_JOB_COMPLETE,
-    GOT_STREAM_DESCRIPTION,
     REQUEST_STREAM_CHUNK,
-    PROCESS_STREAM_CHUNK,
     HANDLE_COMPLETE_STREAM_DATA,
 };
 
@@ -50,18 +45,25 @@ enum IoTJobOperation { SPRITE_DELIVERY, OTA_UPDATE };
 #define OE_PIN 2
 #define CLK_PIN 1
 
-#define STREAM_CHUNK_SIZE 6000
+#define STREAM_CHUNK_SIZE 30000
 
 typedef struct scheduledItem {
     int show_duration;
     bool is_pinned;
     bool is_skipped;
+    bool reported_error;
 } scheduledItem;
 
 typedef struct workItem {
     WorkItemType workItemType;
-    char workItemString[1500];
+    char workItemString[100];
     int workItemInteger;
 } workItem;
+
+typedef struct mqttMessage {
+    char topic[200];
+    const char *pMessage;
+    size_t messageLen;
+} mqttMessage;
 
 #endif
