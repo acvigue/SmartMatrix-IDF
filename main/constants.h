@@ -66,4 +66,10 @@ typedef struct mqttMessage {
     size_t messageLen;
 } mqttMessage;
 
+typedef struct spriteDeliveryItem {
+    char streamID[129];
+    int spriteID;
+    size_t spriteSize;
+} spriteDeliveryItem;
+
 #endif
