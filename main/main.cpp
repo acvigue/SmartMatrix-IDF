@@ -36,7 +36,9 @@ spriteDeliveryItem currentSpriteDeliveryItem;
 QueueHandle_t xWorkerQueue, xMqttMessageQueue, xSpriteDeliveryQueue;
 TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask, spriteDeliveryTask;
 MatrixPanel_I2S_DMA *matrix;
+
 bool isStreaming = false;
+int currentlyDisplayingSprite = 0;
 
 char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
     // Try to get the size of the item
@@ -590,7 +592,6 @@ void Worker_Task(void *arg) {
                             // this is a sprite
                             if (currentWorkItem.workItemInteger == 1) {
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = false;
-                                
                             }
                         } else {
                             ESP_LOGE(WORKER_TAG, "file %s has invalid header!", filePath);
@@ -602,11 +603,13 @@ void Worker_Task(void *arg) {
                         if (currentWorkItem.workItemInteger == 1) {
                             if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
-                                
+
                                 char resp[200];
                                 snprintf(resp, 200, "{\"spriteID\":%d, \"thingName\":\"%s\"}", atoi(currentWorkItem.workItemString), thing_name);
                                 strcpy(tmpTopic, "$aws/rules/smartmatrix_sprite_error");
                                 esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+
+                                xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
                             }
                         }
                     }
@@ -650,6 +653,14 @@ void Worker_Task(void *arg) {
                     isStreaming = false;
                     free(currentStreamTemporaryBuffer);
 
+                    //show if we're currently showing it already
+                    if(currentlyDisplayingSprite == deliveringSpriteID) {
+                        workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                        newWorkItem.workItemInteger = 1;
+                        snprintf(newWorkItem.workItemString, 5, "%d", deliveringSpriteID);
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    }
                 } else if (currentWorkItem.workItemType == WorkItemType::MARK_JOB_COMPLETE) {
                     // The current job document *should* still be in currentJobDocument
                     ESP_LOGI(WORKER_TAG, "marking job complete");
@@ -733,8 +744,8 @@ void Matrix_Task(void *arg) {
 void Schedule_Task(void *arg) {
     /* Initialize the scheduler items */
     scheduledItems = new scheduledItem[100];
-    int currentlyDisplayingSprite = 0;
     unsigned long long currentSpriteStartTime = 0;
+    bool needToSkip = false;
 
     for (int i = 0; i < 100; i++) {
         scheduledItems[i].show_duration = 0;
@@ -743,15 +754,23 @@ void Schedule_Task(void *arg) {
         scheduledItems[i].reported_error = false;
     }
 
+    uint32_t notifiedValue;
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(1000))) {
+            if (notifiedValue == SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT) {
+                needToSkip = true;
+            }
+        }
+
         if (scheduledItems[0].show_duration == 0) {
             // we don't have a schedule? or no sprites in the schedule.
             continue;
         }
 
-        if (pdTICKS_TO_MS(xTaskGetTickCount()) - currentSpriteStartTime > (scheduledItems[currentlyDisplayingSprite].show_duration * 1000)) {
-            if (scheduledItems[currentlyDisplayingSprite].is_pinned) {
+        if ((pdTICKS_TO_MS(xTaskGetTickCount()) - currentSpriteStartTime > (scheduledItems[currentlyDisplayingSprite].show_duration * 1000)) ||
+            needToSkip) {
+            if (scheduledItems[currentlyDisplayingSprite].is_pinned && !needToSkip) {
                 currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
                 continue;
             }
@@ -766,15 +785,14 @@ void Schedule_Task(void *arg) {
                 currentlyDisplayingSprite++;
             }
 
-            char id[4];
-            snprintf(id, 4, "%d", currentlyDisplayingSprite);
-
             workItem newWorkItem;
             newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
             newWorkItem.workItemInteger = 1;
-            strcpy(newWorkItem.workItemString, id);
+            snprintf(newWorkItem.workItemString, 4, "%d", currentlyDisplayingSprite);
             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
             currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
+
+            needToSkip = false;
         }
     }
 }
@@ -839,5 +857,6 @@ extern "C" void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(300000));
         sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
         esp_mqtt_client_publish(mqttClient, tmpTopic, "{}", 0, 0, false);
+        ESP_LOGI(BOOT_TAG, "free heap: %" PRIu32 " int: %" PRIu32 " min: %" PRIu32 "", esp_get_free_heap_size(), esp_get_free_internal_heap_size(), esp_get_minimum_free_heap_size());
     }
 }

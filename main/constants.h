@@ -19,6 +19,7 @@
 /* Inter-task communication values */
 #define MATRIX_TASK_NOTIF_READY 1
 #define MATRIX_TASK_NOTIF_NOT_READY 2
+#define SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT 1
 
 enum WorkItemType {
     SHOW_SPRITE,
