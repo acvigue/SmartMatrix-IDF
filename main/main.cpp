@@ -112,6 +112,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 hasConnected = true;
             }
+
+            isStreaming = false;
+            free(currentStreamTemporaryBuffer);
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
@@ -509,7 +512,7 @@ void SpriteDelivery_Task(void *arg) {
                     esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                 }
             } else {
-                vTaskDelay(1000);
+                vTaskDelay(pdMS_TO_TICKS(1000));
             }
         }
     }
@@ -587,6 +590,7 @@ void Worker_Task(void *arg) {
                             // this is a sprite
                             if (currentWorkItem.workItemInteger == 1) {
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = false;
+                                
                             }
                         } else {
                             ESP_LOGE(WORKER_TAG, "file %s has invalid header!", filePath);
@@ -597,9 +601,12 @@ void Worker_Task(void *arg) {
                         // this is a sprite
                         if (currentWorkItem.workItemInteger == 1) {
                             if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
-                                char resp[200];
-
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
+                                
+                                char resp[200];
+                                snprintf(resp, 200, "{\"spriteID\":%d, \"thingName\":\"%s\"}", atoi(currentWorkItem.workItemString), thing_name);
+                                strcpy(tmpTopic, "$aws/rules/smartmatrix_sprite_error");
+                                esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                             }
                         }
                     }
