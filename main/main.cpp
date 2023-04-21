@@ -350,7 +350,6 @@ void MqttMsg_Task(void *arg) {
                 } else if (strstr(currentMessage.topic, "jobs") != NULL) {
                     if (strstr(currentMessage.topic, "notify-next") != NULL || strstr(currentMessage.topic, "get/accepted") != NULL) {
                         cJSON *jobDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
-                        ESP_LOGI(MQTT_TASK_TAG, "notify next doc: %s", currentMessage.pMessage);
                         if (cJSON_HasObjectItem(jobDoc, "execution") == false) {
                             continue;
                         }
