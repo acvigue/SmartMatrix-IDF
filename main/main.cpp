@@ -514,7 +514,7 @@ void SpriteDelivery_Task(void *arg) {
                     esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                 }
             } else {
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
     }
