@@ -134,7 +134,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // fill buffer
             if (event->current_data_offset == 0) {
                 ESP_LOGD(MQTT_TAG, "creating message buffer for topic %s (size %d)", lastTopic, event->total_data_len);
-                dataBuf = (char *)malloc(event->total_data_len);
+                dataBuf = (char *)heap_caps_malloc(event->total_data_len, MALLOC_CAP_SPIRAM);
             }
 
             memcpy((void *)(dataBuf + event->current_data_offset), event->data, event->data_len);
@@ -413,7 +413,7 @@ void MqttMsg_Task(void *arg) {
 
                         ESP_LOGI(MQTT_TASK_TAG, "of size %d", fileSize);
 
-                        currentStreamTemporaryBuffer = (uint8_t *)malloc(fileSize);
+                        currentStreamTemporaryBuffer = (uint8_t *)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM);
 
                         const char *streamID = cJSON_GetObjectItem(streamDescriptionDoc, "c")->valuestring;
 
@@ -554,7 +554,7 @@ void Worker_Task(void *arg) {
                     string = cJSON_PrintUnformatted(state);
                     cJSON_Delete(state);
 
-                    char *fullUpdateState = (char *)malloc(8192);
+                    char *fullUpdateState = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
                     snprintf(fullUpdateState, 8192, "{\"state\":{\"reported\":%s}}", string);
                     sprintf(tmpTopic, "$aws/things/%s/shadow/update", thing_name);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, fullUpdateState, 0, 0, false);
@@ -578,7 +578,7 @@ void Worker_Task(void *arg) {
 
                         // setup webp buffer and populate from temporary buffer
                         webPData.size = fileSize;
-                        webPData.bytes = (uint8_t *)WebPMalloc(fileSize);
+                        webPData.bytes = (uint8_t *)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM);
 
                         // Fill buffer!
                         fread((void *)webPData.bytes, 1, fileSize, f);
