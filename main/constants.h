@@ -47,6 +47,7 @@ enum IoTJobOperation { SPRITE_DELIVERY, OTA_UPDATE };
 #define CLK_PIN 1
 
 #define STREAM_CHUNK_SIZE 30000
+#define MAX_OPEN_STREAMS 20
 
 typedef struct scheduledItem {
     int show_duration;
@@ -66,11 +67,11 @@ typedef struct mqttMessage {
     const char *pMessage;
     size_t messageLen;
 } mqttMessage;
-
 typedef struct spriteDeliveryItem {
     char streamID[129];
-    int spriteID;
+    uint8_t *tempBuf;
     size_t spriteSize;
+    int spriteID;
 } spriteDeliveryItem;
 
 #endif

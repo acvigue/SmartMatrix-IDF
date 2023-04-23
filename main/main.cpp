@@ -15,10 +15,13 @@
 #include <mqtt_client.h>
 #include <nvs_flash.h>
 #include <stdio.h>
-#include <string.h>
 #include <webp/demux.h>
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
+
+#include <iostream>
+#include <sstream>
+#include <string>
 
 #include "constants.h"
 
@@ -26,18 +29,15 @@ WebPData webPData;
 esp_mqtt_client_handle_t mqttClient;
 
 scheduledItem *scheduledItems = nullptr;
-uint8_t *currentStreamTemporaryBuffer = nullptr;
+spriteDeliveryItem *deliveryItems = new spriteDeliveryItem[20];
 
 char thing_name[18];
 char currentJobDocument[8192];
-char tmpTopic[200];
 
-spriteDeliveryItem currentSpriteDeliveryItem;
-QueueHandle_t xWorkerQueue, xMqttMessageQueue, xSpriteDeliveryQueue;
-TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask, spriteDeliveryTask;
+QueueHandle_t xWorkerQueue, xMqttMessageQueue;
+TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask;
 MatrixPanel_I2S_DMA *matrix;
 
-bool isStreaming = false;
 int currentlyDisplayingSprite = 0;
 
 char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
@@ -57,6 +57,53 @@ char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
     return value;
 }
 
+spriteDeliveryItem getSpriteDeliveryItemByStreamID(const char *streamID) {
+    ESP_LOGI(BOOT_TAG, "getting delivery item stream %s", streamID);
+    for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
+        spriteDeliveryItem x = deliveryItems[i];
+        if (strcmp(x.streamID, streamID) == 0) {
+            ESP_LOGI(BOOT_TAG, "got one (index %d)! size: %d id: %d bufaddr: %p", i, x.spriteSize, x.spriteID, x.tempBuf);
+            return x;
+        }
+    }
+    spriteDeliveryItem x;
+    x.spriteID = 1;
+    return x;
+}
+
+void storeSpriteDeliveryItem(spriteDeliveryItem itemToStore) {
+    ESP_LOGI(BOOT_TAG, "saving delivery size: %d id: %d bufaddr: %p", itemToStore.spriteSize, itemToStore.spriteID, itemToStore.tempBuf);
+    for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
+        spriteDeliveryItem x = deliveryItems[i];
+        if (x.spriteSize == 0) {
+            ESP_LOGI(BOOT_TAG, "saved in index %d", i);
+            deliveryItems[i].spriteID = itemToStore.spriteID;
+            deliveryItems[i].spriteSize = itemToStore.spriteSize;
+            deliveryItems[i].tempBuf = itemToStore.tempBuf;
+            strcpy(deliveryItems[i].streamID, itemToStore.streamID);
+            return;
+        }
+    }
+}
+
+void deleteSpriteDeliveryItem(const char *streamID) {
+    ESP_LOGI(BOOT_TAG, "deleting delivery item %s", streamID);
+    for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
+        spriteDeliveryItem x = deliveryItems[i];
+        if (strcmp(x.streamID, streamID) == 0 || strcmp(streamID, "*") == 0) {
+            if (deliveryItems[i].spriteSize > 0) {
+                ESP_LOGI(BOOT_TAG, "deleted %d", i);
+                free(deliveryItems[i].tempBuf);
+                deliveryItems[i].spriteSize = 0;
+
+                if(strcmp(streamID, "*") != 0) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     static char lastTopic[200];
@@ -70,6 +117,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             failureCount = 0;
 
             // Device shadow topics.
+            char tmpTopic[200];
             sprintf(tmpTopic, "$aws/things/%s/shadow/get/accepted", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
             sprintf(tmpTopic, "$aws/things/%s/shadow/get/rejected", thing_name);
@@ -115,8 +163,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 hasConnected = true;
             }
 
-            isStreaming = false;
-            free(currentStreamTemporaryBuffer);
+            deleteSpriteDeliveryItem("*");
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
@@ -376,6 +423,7 @@ void MqttMsg_Task(void *arg) {
                         ESP_LOGD(MQTT_TASK_TAG, "with ID %s", jobID);
 
                         const char *resp = "{\"status\":\"IN_PROGRESS\", \"expectedVersion\": \"1\"}";
+                        char tmpTopic[200];
                         sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
                         esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
 
@@ -413,8 +461,6 @@ void MqttMsg_Task(void *arg) {
 
                         ESP_LOGI(MQTT_TASK_TAG, "of size %d", fileSize);
 
-                        currentStreamTemporaryBuffer = (uint8_t *)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM);
-
                         const char *streamID = cJSON_GetObjectItem(streamDescriptionDoc, "c")->valuestring;
 
                         workItem newWorkItem;
@@ -429,15 +475,19 @@ void MqttMsg_Task(void *arg) {
                         size_t blockLenDecoded = cJSON_GetObjectItem(streamDataDoc, "l")->valueint;
                         int blockID = cJSON_GetObjectItem(streamDataDoc, "i")->valueint;
                         const uint8_t *blockData = (uint8_t *)cJSON_GetObjectItem(streamDataDoc, "p")->valuestring;
+                        const char *streamID = cJSON_GetObjectItem(streamDataDoc, "c")->valuestring;
                         size_t blockLenEncoded = strlen((const char *)blockData);
                         ESP_LOGD(MQTT_TASK_TAG, "size (decoded): %d", blockLenDecoded);
                         ESP_LOGD(MQTT_TASK_TAG, "size raw: %d", blockLenEncoded);
                         ESP_LOGI(MQTT_TASK_TAG, "block no: %d", blockID);
 
+                        spriteDeliveryItem x = getSpriteDeliveryItemByStreamID(streamID);
+                        uint8_t *tempBuf = x.tempBuf;
+
                         // can we decode here?
                         size_t decodedChunkSize;
-                        int decoded = mbedtls_base64_decode((currentStreamTemporaryBuffer + (blockID * STREAM_CHUNK_SIZE)), ULONG_MAX,
-                                                            &decodedChunkSize, blockData, blockLenEncoded);
+                        int decoded = mbedtls_base64_decode((tempBuf + (blockID * STREAM_CHUNK_SIZE)), ULONG_MAX, &decodedChunkSize, blockData,
+                                                            blockLenEncoded);
                         if (decoded == 0) {
                             ESP_LOGI(MQTT_TASK_TAG, "b64 decoded: %d bytes", decodedChunkSize);
 
@@ -453,11 +503,11 @@ void MqttMsg_Task(void *arg) {
                             ESP_LOGD(MQTT_TASK_TAG, "we got %d bytes in total!", fin);
 
                             workItem newWorkItem;
+                            strcpy(newWorkItem.workItemString, streamID);
                             newWorkItem.workItemType = WorkItemType::HANDLE_COMPLETE_STREAM_DATA;
                             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                         } else {
                             // more blocks needed to recreate the file.. request another
-                            const char *streamID = cJSON_GetObjectItem(streamDataDoc, "c")->valuestring;
                             ESP_LOGD(MQTT_TASK_TAG, "requesting the next block, %d for %s", blockID + 1, streamID);
                             workItem newWorkItem;
                             newWorkItem.workItemType = WorkItemType::REQUEST_STREAM_CHUNK;
@@ -477,12 +527,21 @@ void MqttMsg_Task(void *arg) {
                     int spriteID = cJSON_GetObjectItem(spriteDeliveryDoc, "spriteID")->valueint;
                     size_t spriteSize = cJSON_GetObjectItem(spriteDeliveryDoc, "size")->valueint;
 
-                    spriteDeliveryItem newSpriteDelivery = {
-                        .spriteID = spriteID,
-                        .spriteSize = spriteSize,
-                    };
-                    strcpy(newSpriteDelivery.streamID, streamID);
-                    xQueueSend(xSpriteDeliveryQueue, &newSpriteDelivery, pdMS_TO_TICKS(1000));
+                    uint8_t *tmpBuf = (uint8_t *)heap_caps_malloc(spriteSize, MALLOC_CAP_SPIRAM);
+
+                    spriteDeliveryItem newDelivery;
+                    newDelivery.spriteID = spriteID;
+                    newDelivery.spriteSize = spriteSize;
+                    strcpy(newDelivery.streamID, streamID);
+                    newDelivery.tempBuf = tmpBuf;
+                    storeSpriteDeliveryItem(newDelivery);
+
+                    char tmpTopic[200];
+                    snprintf(tmpTopic, 200, "$aws/things/%s/streams/%s/describe/json", thing_name, streamID);
+                    ESP_LOGD(MQTT_TASK_TAG, "requesting the stream description");
+                    char resp[200];
+                    snprintf(resp, 200, "{\"c\":\"%s\"}", streamID);
+                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                 }
 
                 // when we're done w/ the message, free it
@@ -494,32 +553,6 @@ void MqttMsg_Task(void *arg) {
     }
 }
 
-void SpriteDelivery_Task(void *arg) {
-    xSpriteDeliveryQueue = xQueueCreate(20, sizeof(spriteDeliveryItem));
-
-    if (xSpriteDeliveryQueue == NULL) {
-        return;
-    }
-
-    while (1) {
-        if (xSpriteDeliveryQueue != NULL) {
-            if (!isStreaming) {
-                if (xQueueReceive(xSpriteDeliveryQueue, &currentSpriteDeliveryItem, pdMS_TO_TICKS(1000)) == pdPASS) {
-                    // start the streaming process by requesting the stream.
-                    isStreaming = true;
-                    snprintf(tmpTopic, 200, "$aws/things/%s/streams/%s/describe/json", thing_name, currentSpriteDeliveryItem.streamID);
-                    ESP_LOGD(MQTT_TASK_TAG, "requesting the stream description");
-                    char resp[200];
-                    snprintf(resp, 200, "{\"c\":\"%s\"}", currentSpriteDeliveryItem.streamID);
-                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-                }
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-        }
-    }
-}
-
 void Worker_Task(void *arg) {
     workItem currentWorkItem;
 
@@ -527,6 +560,10 @@ void Worker_Task(void *arg) {
 
     if (xWorkerQueue == NULL) {
         return;
+    }
+
+    for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
+        deliveryItems[i].spriteSize = 0;
     }
 
     while (1) {
@@ -556,6 +593,7 @@ void Worker_Task(void *arg) {
 
                     char *fullUpdateState = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
                     snprintf(fullUpdateState, 8192, "{\"state\":{\"reported\":%s}}", string);
+                    char tmpTopic[200];
                     sprintf(tmpTopic, "$aws/things/%s/shadow/update", thing_name);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, fullUpdateState, 0, 0, false);
                     free(fullUpdateState);
@@ -605,6 +643,7 @@ void Worker_Task(void *arg) {
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
 
                                 char resp[200];
+                                char tmpTopic[200];
                                 snprintf(resp, 200, "{\"spriteID\":%d, \"thingName\":\"%s\"}", atoi(currentWorkItem.workItemString), thing_name);
                                 strcpy(tmpTopic, "$aws/rules/smartmatrix_sprite_error");
                                 esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
@@ -619,15 +658,20 @@ void Worker_Task(void *arg) {
                     ESP_LOGD(WORKER_TAG, "requesting stream chunk no %d for %s", blockNo, streamID);
 
                     char resp[200];
+                    char tmpTopic[200];
                     sprintf(resp, "{\"c\":\"%s\",\"f\":0,\"l\":%d,\"o\":%d,\"n\":1}", streamID, STREAM_CHUNK_SIZE, blockNo);
                     snprintf(tmpTopic, 200, "$aws/things/%s/streams/%s/get/json", thing_name, streamID);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                     ESP_LOGD(WORKER_TAG, "published %s to %s", resp, tmpTopic);
                 } else if (currentWorkItem.workItemType == WorkItemType::HANDLE_COMPLETE_STREAM_DATA) {
                     ESP_LOGI(WORKER_TAG, "stream data is decoded, let's handle it");
+                    const char *streamID = currentWorkItem.workItemString;
 
-                    int deliveringSpriteID = currentSpriteDeliveryItem.spriteID;
-                    size_t deliveringSpriteSize = currentSpriteDeliveryItem.spriteSize;
+                    spriteDeliveryItem currentDeliveryItem = getSpriteDeliveryItemByStreamID(streamID);
+
+                    int deliveringSpriteID = currentDeliveryItem.spriteID;
+                    size_t deliveringSpriteSize = currentDeliveryItem.spriteSize;
+                    uint8_t *tempBuf = currentDeliveryItem.tempBuf;
 
                     ESP_LOGD(WORKER_TAG, ".. sprite delivery for %d!", deliveringSpriteID);
 
@@ -642,7 +686,7 @@ void Worker_Task(void *arg) {
                     FILE *f = fopen(filePath, "w");
                     if (f != NULL) {
                         uint8_t wtf[2];
-                        fwrite((currentStreamTemporaryBuffer) ?: wtf, 1, deliveringSpriteSize, f);
+                        fwrite((tempBuf) ?: wtf, 1, deliveringSpriteSize, f);
                         fclose(f);
                         ESP_LOGI(WORKER_TAG, "wrote %d bytes", deliveringSpriteSize);
                     } else {
@@ -650,11 +694,10 @@ void Worker_Task(void *arg) {
                     }
 
                     // this job is complete, we can mark it
-                    isStreaming = false;
-                    free(currentStreamTemporaryBuffer);
+                    deleteSpriteDeliveryItem(streamID);
 
-                    //show if we're currently showing it already
-                    if(currentlyDisplayingSprite == deliveringSpriteID) {
+                    // show if we're currently showing it already
+                    if (currentlyDisplayingSprite == deliveringSpriteID) {
                         workItem newWorkItem;
                         newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                         newWorkItem.workItemInteger = 1;
@@ -671,6 +714,7 @@ void Worker_Task(void *arg) {
                     ESP_LOGD(WORKER_TAG, "... for job %s", jobID);
                     const char *resp = "{\"status\":\"SUCCEEDED\", \"expectedVersion\": \"2\"}";
 
+                    char tmpTopic[200];
                     sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
                     esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
 
@@ -823,7 +867,6 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 3500, NULL, 5, &mqttMsgTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
-    xTaskCreatePinnedToCore(SpriteDelivery_Task, "DeliveryTask", 3500, NULL, 5, &spriteDeliveryTask, 1);
 
     ESP_ERROR_CHECK(esp_netif_init());
 
@@ -855,8 +898,10 @@ extern "C" void app_main(void) {
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(300000));
+        char tmpTopic[200];
         sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
         esp_mqtt_client_publish(mqttClient, tmpTopic, "{}", 0, 0, false);
-        ESP_LOGI(BOOT_TAG, "free heap: %" PRIu32 " int: %" PRIu32 " min: %" PRIu32 "", esp_get_free_heap_size(), esp_get_free_internal_heap_size(), esp_get_minimum_free_heap_size());
+        ESP_LOGI(BOOT_TAG, "free heap: %" PRIu32 " int: %" PRIu32 " min: %" PRIu32 "", esp_get_free_heap_size(), esp_get_free_internal_heap_size(),
+                 esp_get_minimum_free_heap_size());
     }
 }
