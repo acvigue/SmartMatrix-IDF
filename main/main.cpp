@@ -58,11 +58,9 @@ char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
 }
 
 spriteDeliveryItem getSpriteDeliveryItemByStreamID(const char *streamID) {
-    ESP_LOGI(BOOT_TAG, "getting delivery item stream %s", streamID);
     for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
         spriteDeliveryItem x = deliveryItems[i];
         if (strcmp(x.streamID, streamID) == 0) {
-            ESP_LOGI(BOOT_TAG, "got one (index %d)! size: %d id: %d bufaddr: %p", i, x.spriteSize, x.spriteID, x.tempBuf);
             return x;
         }
     }
@@ -72,11 +70,9 @@ spriteDeliveryItem getSpriteDeliveryItemByStreamID(const char *streamID) {
 }
 
 void storeSpriteDeliveryItem(spriteDeliveryItem itemToStore) {
-    ESP_LOGI(BOOT_TAG, "saving delivery size: %d id: %d bufaddr: %p", itemToStore.spriteSize, itemToStore.spriteID, itemToStore.tempBuf);
     for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
         spriteDeliveryItem x = deliveryItems[i];
         if (x.spriteSize == 0) {
-            ESP_LOGI(BOOT_TAG, "saved in index %d", i);
             deliveryItems[i].spriteID = itemToStore.spriteID;
             deliveryItems[i].spriteSize = itemToStore.spriteSize;
             deliveryItems[i].tempBuf = itemToStore.tempBuf;
@@ -87,12 +83,10 @@ void storeSpriteDeliveryItem(spriteDeliveryItem itemToStore) {
 }
 
 void deleteSpriteDeliveryItem(const char *streamID) {
-    ESP_LOGI(BOOT_TAG, "deleting delivery item %s", streamID);
     for (int i = 0; i < MAX_OPEN_STREAMS; i++) {
         spriteDeliveryItem x = deliveryItems[i];
         if (strcmp(x.streamID, streamID) == 0 || strcmp(streamID, "*") == 0) {
             if (deliveryItems[i].spriteSize > 0) {
-                ESP_LOGI(BOOT_TAG, "deleted %d", i);
                 free(deliveryItems[i].tempBuf);
                 deliveryItems[i].spriteSize = 0;
 
@@ -895,13 +889,4 @@ extern "C" void app_main(void) {
     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(300000));
-        char tmpTopic[200];
-        sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
-        esp_mqtt_client_publish(mqttClient, tmpTopic, "{}", 0, 0, false);
-        ESP_LOGI(BOOT_TAG, "free heap: %" PRIu32 " int: %" PRIu32 " min: %" PRIu32 "", esp_get_free_heap_size(), esp_get_free_internal_heap_size(),
-                 esp_get_minimum_free_heap_size());
-    }
 }
