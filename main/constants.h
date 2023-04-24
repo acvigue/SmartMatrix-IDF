@@ -25,8 +25,7 @@ enum WorkItemType {
     SHOW_SPRITE,
     UPDATE_REPORTED_SHADOW,
     MARK_JOB_COMPLETE,
-    REQUEST_STREAM_CHUNK,
-    HANDLE_COMPLETE_STREAM_DATA,
+    STORE_RECEIVED_SPRITE,
 };
 
 enum IoTJobOperation { SPRITE_DELIVERY, OTA_UPDATE };
@@ -60,6 +59,7 @@ typedef struct workItem {
     WorkItemType workItemType;
     char workItemString[100];
     int workItemInteger;
+    void *pArg;
 } workItem;
 
 typedef struct mqttMessage {
@@ -67,11 +67,5 @@ typedef struct mqttMessage {
     const char *pMessage;
     size_t messageLen;
 } mqttMessage;
-typedef struct spriteDeliveryItem {
-    char streamID[129];
-    uint8_t *tempBuf;
-    size_t spriteSize;
-    int spriteID;
-} spriteDeliveryItem;
 
 #endif
