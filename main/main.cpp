@@ -19,6 +19,7 @@
 #include <webp/demux.h>
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
+#include <qrcode.h>
 
 #include "constants.h"
 
@@ -620,7 +621,7 @@ void Matrix_Task(void *arg) {
                     uint8_t *buf;
                     if (WebPAnimDecoderGetNext(dec, &buf, &lastFrameTimestamp)) {
                         int px = 0;
-                        if(!isSleeping) {
+                        if (!isSleeping) {
                             for (int y = 0; y < MATRIX_HEIGHT; y++) {
                                 for (int x = 0; x < MATRIX_WIDTH; x++) {
                                     matrix.drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
@@ -628,7 +629,7 @@ void Matrix_Task(void *arg) {
                                 }
                             }
                         } else {
-                            matrix.fillScreenRGB888(0,0,0);
+                            matrix.fillScreenRGB888(0, 0, 0);
                         }
                         currentFrame++;
                         if (!WebPAnimDecoderHasMoreFrames(dec)) {
@@ -650,7 +651,7 @@ void Matrix_Task(void *arg) {
                 currentBrightness++;
             }
             ESP_LOGI(MATRIX_TAG, "current: %d, desired: %d", currentBrightness, desiredBrightness);
-            //matrix->setPanelBrightness((uint8_t) currentBrightness);
+            // matrix->setPanelBrightness((uint8_t) currentBrightness);
         }
     }
 }
@@ -711,22 +712,6 @@ void Schedule_Task(void *arg) {
     }
 }
 
-void getBrightness(TimerHandle_t xTimer) {
-    uint32_t lux;
-    esp_err_t res;
-
-    if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
-        ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
-    } else {
-        ESP_LOGI(BOOT_TAG, "Illuminance: %" PRIu32 " Lux", lux);
-        if (lux > 1) {
-            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithoutOverwrite);
-        } else {
-            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithoutOverwrite);
-        }
-    }
-}
-
 extern "C" void app_main(void) {
     /* Start the matrix */
     matrix.begin();
@@ -754,11 +739,6 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(tsl2561_init(&tslSensor));
 
     ESP_LOGI(BOOT_TAG, "Found TSL2561 in package %s", tslSensor.package_type == TSL2561_PACKAGE_CS ? "CS" : "T/FN/CL");
-
-    tslTimer = xTimerCreate("TSL Timer", pdMS_TO_TICKS(1000), pdTRUE, (void *)0, &getBrightness);
-    if (xTimerStart(tslTimer, 10) != pdPASS) {
-        return;
-    }
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
     xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 3500, NULL, 5, &mqttMsgTask, 1);
@@ -792,4 +772,20 @@ extern "C" void app_main(void) {
     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    uint32_t lux;
+    esp_err_t res;
+    while (1) {
+        if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
+            ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
+        } else {
+            ESP_LOGI(BOOT_TAG, "Illuminance: %" PRIu32 " Lux", lux);
+            if (lux > 0) {
+                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithoutOverwrite);
+            } else {
+                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithoutOverwrite);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
