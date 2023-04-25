@@ -1,0 +1,12 @@
+[submodule "components/ESP32-HUB75-MatrixPanel-DMA"]
+	path = components/ESP32-HUB75-MatrixPanel-DMA
+	url = https://github.com/mrfaptastic/ESP32-HUB75-MatrixPanel-DMA
+[submodule "components/libwebp"]
+	path = components/libwebp
+	url = https://github.com/acvigue/libwebp
+[submodule "components/esp_littlefs"]
+	path = components/esp_littlefs
+	url = https://github.com/joltwallet/esp_littlefs
+[submodule "components/esp-idf-lib"]
+	path = components/esp-idf-lib
+	url = https://github.com/UncleRus/esp-idf-lib
