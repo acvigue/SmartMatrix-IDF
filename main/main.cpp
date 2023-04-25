@@ -15,13 +15,10 @@
 #include <mqtt_client.h>
 #include <nvs_flash.h>
 #include <stdio.h>
+#include <tsl2561.h>
 #include <webp/demux.h>
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
-
-#include <iostream>
-#include <sstream>
-#include <string>
 
 #include "constants.h"
 
@@ -35,9 +32,14 @@ char currentJobDocument[8192];
 
 QueueHandle_t xWorkerQueue, xMqttMessageQueue;
 TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask;
-MatrixPanel_I2S_DMA *matrix;
+TimerHandle_t tslTimer, brightnessTimer;
 
-int currentlyDisplayingSprite = 0;
+HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
+HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
+MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
+tsl2561_t tslSensor = {0};
+
+int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
 
 char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
     // Try to get the size of the item
@@ -580,6 +582,7 @@ void Matrix_Task(void *arg) {
     unsigned long animStartTS = 0;
     int lastFrameTimestamp = 0;
     int currentFrame = 0;
+    bool isSleeping = false;
     uint32_t notifiedValue;
     WebPAnimDecoder *dec = nullptr;
 
@@ -598,6 +601,10 @@ void Matrix_Task(void *arg) {
                 lastFrameTimestamp = 0;
                 currentFrame = 0;
                 isReady = true;
+            } else if (notifiedValue == MATRIX_TASK_NOTIF_WAKE_UP) {
+                isSleeping = false;
+            } else if (notifiedValue == MATRIX_TASK_NOTIF_SLEEP) {
+                isSleeping = true;
             }
         }
 
@@ -613,11 +620,15 @@ void Matrix_Task(void *arg) {
                     uint8_t *buf;
                     if (WebPAnimDecoderGetNext(dec, &buf, &lastFrameTimestamp)) {
                         int px = 0;
-                        for (int y = 0; y < MATRIX_HEIGHT; y++) {
-                            for (int x = 0; x < MATRIX_WIDTH; x++) {
-                                matrix->drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
-                                px++;
+                        if(!isSleeping) {
+                            for (int y = 0; y < MATRIX_HEIGHT; y++) {
+                                for (int x = 0; x < MATRIX_WIDTH; x++) {
+                                    matrix.drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
+                                    px++;
+                                }
                             }
+                        } else {
+                            matrix.fillScreenRGB888(0,0,0);
                         }
                         currentFrame++;
                         if (!WebPAnimDecoderHasMoreFrames(dec)) {
@@ -630,6 +641,16 @@ void Matrix_Task(void *arg) {
                     }
                 }
             }
+        }
+
+        if (currentBrightness != desiredBrightness) {
+            if (desiredBrightness < currentBrightness) {
+                currentBrightness--;
+            } else {
+                currentBrightness++;
+            }
+            ESP_LOGI(MATRIX_TAG, "current: %d, desired: %d", currentBrightness, desiredBrightness);
+            //matrix->setPanelBrightness((uint8_t) currentBrightness);
         }
     }
 }
@@ -670,9 +691,9 @@ void Schedule_Task(void *arg) {
 
             currentlyDisplayingSprite++;
 
-            if(scheduledItems[currentlyDisplayingSprite].show_duration == 0) {
+            if (scheduledItems[currentlyDisplayingSprite].show_duration == 0) {
                 currentlyDisplayingSprite = 0;
-            } 
+            }
 
             if (scheduledItems[currentlyDisplayingSprite].is_skipped) {
                 continue;
@@ -690,12 +711,27 @@ void Schedule_Task(void *arg) {
     }
 }
 
+void getBrightness(TimerHandle_t xTimer) {
+    uint32_t lux;
+    esp_err_t res;
+
+    if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
+        ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
+    } else {
+        ESP_LOGI(BOOT_TAG, "Illuminance: %" PRIu32 " Lux", lux);
+        if (lux > 1) {
+            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithoutOverwrite);
+        } else {
+            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithoutOverwrite);
+        }
+    }
+}
+
 extern "C" void app_main(void) {
     /* Start the matrix */
-    HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
-    HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
-    matrix = new MatrixPanel_I2S_DMA(mxconfig);
-    matrix->begin();
+    matrix.begin();
+    matrix.setBrightness(16);
+    currentBrightness = 100;
 
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
@@ -711,6 +747,18 @@ extern "C" void app_main(void) {
         .dont_mount = false,
     };
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
+
+    ESP_ERROR_CHECK(i2cdev_init());
+
+    ESP_ERROR_CHECK(tsl2561_init_desc(&tslSensor, 0x39, 0, (gpio_num_t)3, (gpio_num_t)0));
+    ESP_ERROR_CHECK(tsl2561_init(&tslSensor));
+
+    ESP_LOGI(BOOT_TAG, "Found TSL2561 in package %s", tslSensor.package_type == TSL2561_PACKAGE_CS ? "CS" : "T/FN/CL");
+
+    tslTimer = xTimerCreate("TSL Timer", pdMS_TO_TICKS(1000), pdTRUE, (void *)0, &getBrightness);
+    if (xTimerStart(tslTimer, 10) != pdPASS) {
+        return;
+    }
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
     xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 3500, NULL, 5, &mqttMsgTask, 1);

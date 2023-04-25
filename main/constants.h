@@ -19,6 +19,8 @@
 /* Inter-task communication values */
 #define MATRIX_TASK_NOTIF_READY 1
 #define MATRIX_TASK_NOTIF_NOT_READY 2
+#define MATRIX_TASK_NOTIF_SLEEP 3
+#define MATRIX_TASK_NOTIF_WAKE_UP 4
 #define SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT 1
 
 enum WorkItemType {
