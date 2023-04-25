@@ -19,7 +19,6 @@
 #include <webp/demux.h>
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
-#include <qrcode.h>
 
 #include "constants.h"
 
