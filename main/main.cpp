@@ -650,7 +650,7 @@ void Matrix_Task(void *arg) {
                 currentBrightness++;
             }
             ESP_LOGI(MATRIX_TAG, "current: %d, desired: %d", currentBrightness, desiredBrightness);
-            // matrix->setPanelBrightness((uint8_t) currentBrightness);
+            matrix.setBrightness((uint8_t) currentBrightness);
         }
     }
 }
