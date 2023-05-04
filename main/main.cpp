@@ -64,7 +64,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
             // Request to get the initial shadow state
             sprintf(tmpTopic, "smartmatrix/%s/status", thing_name);
-            esp_mqtt_client_publish(event->client, tmpTopic, "get_schedule", 0, 0, false);
+            esp_mqtt_client_publish(event->client, tmpTopic, "{\"type\":\"get_schedule\"}", 0, 0, false);
 
             if (!hasConnected) {
                 workItem newWorkItem;
@@ -339,10 +339,36 @@ void Worker_Task(void *arg) {
 
                             // this is a sprite
                             if (currentWorkItem.workItemInteger == 1) {
-                                scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = false;
+                                int currentSpriteID = atoi(currentWorkItem.workItemString);
+                                scheduledItems[currentSpriteID].reported_error = false;
+
+                                char resp[200];
+                                char tmpTopic[200];
+                                snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
+
+                                int nextSpriteID = (scheduledItems[currentSpriteID + 1].show_duration > 0) ? currentSpriteID + 1 : 0;
+
+                                snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d}", currentSpriteID,
+                                         nextSpriteID);
+                                esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                             }
                         } else {
                             ESP_LOGE(WORKER_TAG, "file %s has invalid header!", filePath);
+
+                            // this is a sprite
+                            if (currentWorkItem.workItemInteger == 1) {
+                                if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
+                                    scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
+
+                                    char resp[200];
+                                    char tmpTopic[200];
+                                    snprintf(tmpTopic, 200, "smartmatrix/%s/error", thing_name);
+                                    snprintf(resp, 200, "{\"spriteID\":%d, \"reason\":\"parse_error\"}", atoi(currentWorkItem.workItemString));
+                                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+
+                                    xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
+                                }
+                            }
                         }
                     } else {
                         ESP_LOGE(WORKER_TAG, "couldn't find file %s", filePath);
@@ -354,8 +380,8 @@ void Worker_Task(void *arg) {
 
                                 char resp[200];
                                 char tmpTopic[200];
-                                snprintf(resp, 200, "{\"spriteID\":%d, \"thingName\":\"%s\"}", atoi(currentWorkItem.workItemString), thing_name);
-                                strcpy(tmpTopic, "$aws/rules/smartmatrix_sprite_error");
+                                snprintf(tmpTopic, 200, "smartmatrix/%s/error", thing_name);
+                                snprintf(resp, 200, "{\"spriteID\":%d, \"reason\":\"not_found\"}", atoi(currentWorkItem.workItemString));
                                 esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
 
                                 xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
@@ -506,6 +532,10 @@ void Schedule_Task(void *arg) {
 
         if (scheduledItems[0].show_duration == 0) {
             // we don't have a schedule? or no sprites in the schedule.
+            const char* resp = "{\"type\": \"get_schedule\"}";
+            char tmpTopic[200];
+            snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
+            esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
             continue;
         }
 
@@ -607,7 +637,7 @@ extern "C" void app_main(void) {
         } else {
             if (lux > 5) {
                 desiredBrightness = 100;
-            } else if(lux > 0) {
+            } else if (lux > 0) {
                 desiredBrightness = 25;
             } else {
                 desiredBrightness = 0;
