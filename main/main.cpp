@@ -605,10 +605,10 @@ extern "C" void app_main(void) {
         if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
             ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
         } else {
-            if (lux > 10) {
+            if (lux > 5) {
                 desiredBrightness = 100;
             } else if(lux > 0) {
-                desiredBrightness = 50;
+                desiredBrightness = 25;
             } else {
                 desiredBrightness = 0;
             }
