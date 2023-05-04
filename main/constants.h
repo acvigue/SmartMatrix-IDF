@@ -43,8 +43,8 @@ enum IoTJobOperation { SPRITE_DELIVERY, OTA_UPDATE };
 #define C_PIN 21
 #define D_PIN 5
 #define E_PIN -1  // required for 1/32 scan panels, like 64x64. Any available pin would do, i.e. IO32
-#define LAT_PIN 4
-#define OE_PIN 2
+#define LAT_PIN 2
+#define OE_PIN 4
 #define CLK_PIN 1
 
 #define STREAM_CHUNK_SIZE 30000

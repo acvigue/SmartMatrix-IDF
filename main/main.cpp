@@ -21,6 +21,7 @@
 #include <wifi_provisioning/scheme_ble.h>
 
 #include "constants.h"
+#include "secrets.h"
 
 WebPData webPData;
 esp_mqtt_client_handle_t mqttClient;
@@ -28,7 +29,6 @@ esp_mqtt_client_handle_t mqttClient;
 scheduledItem *scheduledItems = nullptr;
 
 char thing_name[18];
-char currentJobDocument[8192];
 
 QueueHandle_t xWorkerQueue, xMqttMessageQueue;
 TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask;
@@ -40,23 +40,6 @@ MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
 tsl2561_t tslSensor = {0};
 
 int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
-
-char *nvs_load_value_if_exist(nvs_handle handle, const char *key) {
-    // Try to get the size of the item
-    size_t value_size;
-    if (nvs_get_str(handle, key, NULL, &value_size) != ESP_OK) {
-        ESP_LOGE(BOOT_TAG, "Failed to get size of key: %s", key);
-        return NULL;
-    }
-
-    char *value = (char *)malloc(value_size);
-    if (nvs_get_str(handle, key, value, &value_size) != ESP_OK) {
-        ESP_LOGE(BOOT_TAG, "Failed to load key: %s", key);
-        return NULL;
-    }
-
-    return value;
-}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -72,33 +55,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
             // Device shadow topics.
             char tmpTopic[200];
-            sprintf(tmpTopic, "$aws/things/%s/shadow/get/accepted", thing_name);
-            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
-            sprintf(tmpTopic, "$aws/things/%s/shadow/get/rejected", thing_name);
-            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
-            sprintf(tmpTopic, "$aws/things/%s/shadow/update/delta", thing_name);
-            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
-            // Job topics
-            sprintf(tmpTopic, "$aws/things/%s/jobs/notify-next", thing_name);
-            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
-            sprintf(tmpTopic, "$aws/things/%s/jobs/get/rejected", thing_name);
-            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
-            sprintf(tmpTopic, "$aws/things/%s/jobs/get/accepted", thing_name);
+            sprintf(tmpTopic, "smartmatrix/%s/schedule_delivery", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
             sprintf(tmpTopic, "smartmatrix/%s/sprite_delivery", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
             // Request to get the initial shadow state
-            sprintf(tmpTopic, "$aws/things/%s/shadow/get", thing_name);
-            esp_mqtt_client_publish(event->client, tmpTopic, "{}", 0, 0, false);
-
-            // Request to get the next pending job
-            sprintf(tmpTopic, "$aws/things/%s/jobs/$next/get", thing_name);
-            char resp[200];
-            snprintf(resp, 200, "{\"jobId\":\"$next\",\"thingName\":\"%s\"}", thing_name);
-            esp_mqtt_client_publish(event->client, tmpTopic, resp, 0, 0, false);
+            sprintf(tmpTopic, "smartmatrix/%s/status", thing_name);
+            esp_mqtt_client_publish(event->client, tmpTopic, "get_schedule", 0, 0, false);
 
             if (!hasConnected) {
                 workItem newWorkItem;
@@ -238,46 +204,21 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             strcpy(newWorkItem.workItemString, "connect_cloud");
             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
-            char *private_key = nullptr;
-            char *certificate = nullptr;
-
-            /* Get TLS client credentials from NVS */
-
-            nvs_flash_init_partition(MFG_PARTITION_NAME);
-
-            nvs_handle handle;
-            nvs_open_from_partition(MFG_PARTITION_NAME, "certs", NVS_READONLY, &handle);
-
-            private_key = nvs_load_value_if_exist(handle, "client_key");
-            certificate = nvs_load_value_if_exist(handle, "client_cert");
-            nvs_close(handle);
-
-            // Check if both items have been correctly retrieved
-            if (private_key == NULL || certificate == NULL) {
-                ESP_LOGE(MQTT_TAG, "Private key and/or cert could not be loaded");
-                esp_restart();
-            }
-
             /* Setup MQTT */
-            const esp_mqtt_client_config_t mqtt_cfg = {.broker = {.address = "mqtts://a2o3d87gplncoj-ats.iot.us-east-1.amazonaws.com:8883",
-                                                                  .verification =
-                                                                      {
-                                                                          .crt_bundle_attach = esp_crt_bundle_attach,
-                                                                      }},
-                                                       .credentials = {.client_id = thing_name,
-                                                                       .authentication =
-                                                                           {
-                                                                               .certificate = certificate,
-                                                                               .key = private_key,
-                                                                           }},
-                                                       .network =
-                                                           {
-                                                               .reconnect_timeout_ms = 2500,
-                                                               .timeout_ms = 10000,
-                                                           },
-                                                       .buffer = {
-                                                           .size = 4096,
-                                                       }};
+            const esp_mqtt_client_config_t mqtt_cfg = {
+                .broker =
+                    {
+                        .address = MQTT_HOST,
+                    },
+                .credentials = {.username = MQTT_USERNAME, .client_id = thing_name, .authentication = {.password = MQTT_PASSWORD}},
+                .network =
+                    {
+                        .reconnect_timeout_ms = 2500,
+                        .timeout_ms = 10000,
+                    },
+                .buffer = {
+                    .size = 4096,
+                }};
 
             mqttClient = esp_mqtt_client_init(&mqtt_cfg);
 
@@ -301,93 +242,7 @@ void MqttMsg_Task(void *arg) {
         if (xMqttMessageQueue != NULL) {
             if (xQueueReceive(xMqttMessageQueue, &(currentMessage), pdMS_TO_TICKS(1000)) == pdPASS) {
                 ESP_LOGD(MQTT_TASK_TAG, "got item from queue!");
-                if (strstr(currentMessage.topic, "shadow") != NULL) {
-                    if (strstr(currentMessage.topic, "get/accepted") != NULL || strstr(currentMessage.topic, "update/delta") != NULL) {
-                        ESP_LOGD(MQTT_TASK_TAG, "parsing desired shadow");
-                        cJSON *shadowDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
-                        cJSON *state = cJSON_GetObjectItem(shadowDoc, "state");
-
-                        cJSON *schedule = nullptr;
-                        if (strstr(currentMessage.topic, "get") != NULL) {
-                            cJSON *desired = cJSON_GetObjectItem(state, "desired");
-                            schedule = cJSON_GetObjectItem(desired, "schedule");
-                        } else if (strstr(currentMessage.topic, "delta") != NULL) {
-                            schedule = cJSON_GetObjectItem(state, "schedule");
-                        }
-
-                        if (schedule != nullptr) {
-                            int itemCount = cJSON_GetArraySize(schedule);
-                            for (int i = 0; i < itemCount; i++) {
-                                cJSON *item = cJSON_GetArrayItem(schedule, i);
-                                int itemDuration = cJSON_GetObjectItem(item, "duration")->valueint;
-                                bool itemPinned = cJSON_GetObjectItem(item, "pinned")->valueint;
-                                bool itemSkipped = cJSON_GetObjectItem(item, "skipped")->valueint;
-                                scheduledItems[i].show_duration = itemDuration;
-                                scheduledItems[i].is_pinned = itemPinned;
-                                scheduledItems[i].is_skipped = itemSkipped;
-                            }
-                            scheduledItems[itemCount].show_duration = 0;
-
-                            workItem newWorkItem;
-                            newWorkItem.workItemType = WorkItemType::UPDATE_REPORTED_SHADOW;
-                            xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                        }
-
-                        cJSON_Delete(shadowDoc);
-                    } else if (strstr(currentMessage.topic, "get/rejected") != NULL) {
-                        // AWS rejected our get shadow request, generate and post the reported state.
-                        ESP_LOGE(MQTT_TAG, "couldn't fetch shadow, creating one");
-
-                        workItem newWorkItem;
-                        newWorkItem.workItemType = WorkItemType::UPDATE_REPORTED_SHADOW;
-                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                    }
-                } else if (strstr(currentMessage.topic, "jobs") != NULL) {
-                    if (strstr(currentMessage.topic, "notify-next") != NULL || strstr(currentMessage.topic, "get/accepted") != NULL) {
-                        cJSON *jobDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
-                        if (cJSON_HasObjectItem(jobDoc, "execution") == false) {
-                            continue;
-                        }
-
-                        cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
-
-                        const char *status = cJSON_GetObjectItem(execution, "status")->valuestring;
-                        if (strcmp(status, "QUEUED") != 0) {
-                            continue;
-                        }
-
-                        ESP_LOGI(MQTT_TASK_TAG, "we got a new job!");
-
-                        cJSON *jobParameters = cJSON_GetObjectItem(execution, "jobDocument");
-                        IoTJobOperation operation = (IoTJobOperation)cJSON_GetObjectItem(jobParameters, "operation")->valueint;
-
-                        // Mark the job as in progress, then we can do something w/ the job type (int param)
-                        const char *jobID = cJSON_GetObjectItem(execution, "jobId")->valuestring;
-                        ESP_LOGD(MQTT_TASK_TAG, "with ID %s", jobID);
-
-                        const char *resp = "{\"status\":\"IN_PROGRESS\", \"expectedVersion\": \"1\"}";
-                        char tmpTopic[200];
-                        sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
-                        esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-
-                        strncpy(currentJobDocument, currentMessage.pMessage, currentMessage.messageLen);
-                        /*
-                        if (operation == IoTJobOperation::SPRITE_DELIVERY) {
-                            ESP_LOGD(MQTT_TASK_TAG, "it's a sprite delivery");
-                            // jobDocument has (spriteID: int, streamID: string (128))
-                            const char *streamID = cJSON_GetObjectItem(jobParameters, "streamID")->valuestring;
-
-                            // start the streaming process by requesting the stream.
-                            snprintf(tmpTopic, 200, "$aws/things/%s/streams/%s/describe/json", thing_name, streamID);
-                            ESP_LOGD(MQTT_TASK_TAG, "requesting the stream description");
-                            char resp[200];
-                            snprintf(resp, 200, "{\"c\":\"%s\"}", streamID);
-                            esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-                        }
-                        */
-                        cJSON_Delete(jobDoc);
-                    }
-                } else if (strstr(currentMessage.topic, "sprite_delivery") != NULL) {
+                if (strstr(currentMessage.topic, "sprite_delivery") != NULL) {
                     ESP_LOGI(MQTT_TASK_TAG, "we got a sprite delivery!");
                     cJSON *spriteDeliveryDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
 
@@ -412,6 +267,24 @@ void MqttMsg_Task(void *arg) {
                     xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
                     cJSON_Delete(spriteDeliveryDoc);
+                } else if (strstr(currentMessage.topic, "schedule_delivery") != NULL) {
+                    cJSON *schedule = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
+
+                    if (schedule != nullptr) {
+                        int itemCount = cJSON_GetArraySize(schedule);
+                        for (int i = 0; i < itemCount; i++) {
+                            cJSON *item = cJSON_GetArrayItem(schedule, i);
+                            int itemDuration = cJSON_GetObjectItem(item, "duration")->valueint;
+                            bool itemPinned = cJSON_GetObjectItem(item, "pinned")->valueint;
+                            bool itemSkipped = cJSON_GetObjectItem(item, "skipped")->valueint;
+                            scheduledItems[i].show_duration = itemDuration;
+                            scheduledItems[i].is_pinned = itemPinned;
+                            scheduledItems[i].is_skipped = itemSkipped;
+                        }
+                        scheduledItems[itemCount].show_duration = 0;
+                    }
+
+                    cJSON_Delete(schedule);
                 }
 
                 // when we're done w/ the message, free it
@@ -435,36 +308,7 @@ void Worker_Task(void *arg) {
     while (1) {
         if (xWorkerQueue != NULL) {
             if (xQueueReceive(xWorkerQueue, &(currentWorkItem), pdMS_TO_TICKS(1000)) == pdPASS) {
-                if (currentWorkItem.workItemType == WorkItemType::UPDATE_REPORTED_SHADOW) {
-                    ESP_LOGI(WORKER_TAG, "updating reported shadow");
-                    cJSON *state = cJSON_CreateObject();
-                    cJSON *schedule = cJSON_CreateArray();
-                    cJSON_AddItemToObject(state, "schedule", schedule);
-
-                    for (int i = 0; i < 100; i++) {
-                        if (scheduledItems[i].show_duration == 0) {
-                            break;
-                        }
-                        cJSON *scheduleItem = cJSON_CreateObject();
-                        cJSON_AddItemToArray(schedule, scheduleItem);
-
-                        cJSON_AddItemToObject(scheduleItem, "duration", cJSON_CreateNumber(scheduledItems[i].show_duration));
-                        cJSON_AddItemToObject(scheduleItem, "skipped", cJSON_CreateBool(scheduledItems[i].is_skipped));
-                        cJSON_AddItemToObject(scheduleItem, "pinned", cJSON_CreateBool(scheduledItems[i].is_pinned));
-                    }
-
-                    char *string = NULL;
-                    string = cJSON_PrintUnformatted(state);
-                    cJSON_Delete(state);
-
-                    char *fullUpdateState = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
-                    snprintf(fullUpdateState, 8192, "{\"state\":{\"reported\":%s}}", string);
-                    char tmpTopic[200];
-                    sprintf(tmpTopic, "$aws/things/%s/shadow/update", thing_name);
-                    esp_mqtt_client_publish(mqttClient, tmpTopic, fullUpdateState, 0, 0, false);
-                    free(fullUpdateState);
-                    free(string);
-                } else if (currentWorkItem.workItemType == WorkItemType::SHOW_SPRITE) {
+                if (currentWorkItem.workItemType == WorkItemType::SHOW_SPRITE) {
                     char filePath[40];
                     snprintf(filePath, 40, "/fs/%s.webp", currentWorkItem.workItemString);
                     struct stat st;
@@ -555,22 +399,6 @@ void Worker_Task(void *arg) {
                         snprintf(newWorkItem.workItemString, 5, "%d", spriteID);
                         xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                     }
-                } else if (currentWorkItem.workItemType == WorkItemType::MARK_JOB_COMPLETE) {
-                    // The current job document *should* still be in currentJobDocument
-                    ESP_LOGI(WORKER_TAG, "marking job complete");
-                    cJSON *jobDoc = cJSON_Parse(currentJobDocument);
-                    cJSON *execution = cJSON_GetObjectItem(jobDoc, "execution");
-
-                    const char *jobID = cJSON_GetObjectItem(execution, "jobId")->valuestring;
-                    ESP_LOGD(WORKER_TAG, "... for job %s", jobID);
-                    const char *resp = "{\"status\":\"SUCCEEDED\", \"expectedVersion\": \"2\"}";
-
-                    char tmpTopic[200];
-                    sprintf(tmpTopic, "$aws/things/%s/jobs/%s/update", thing_name, jobID);
-                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-
-                    strcpy(currentJobDocument, "");
-                    cJSON_Delete(jobDoc);
                 }
             }
         }
@@ -649,8 +477,7 @@ void Matrix_Task(void *arg) {
             } else {
                 currentBrightness++;
             }
-            ESP_LOGI(MATRIX_TAG, "current: %d, desired: %d", currentBrightness, desiredBrightness);
-            matrix.setBrightness((uint8_t) currentBrightness);
+            matrix.setBrightness((uint8_t)currentBrightness);
         }
     }
 }
@@ -714,8 +541,8 @@ void Schedule_Task(void *arg) {
 extern "C" void app_main(void) {
     /* Start the matrix */
     matrix.begin();
-    matrix.setBrightness(16);
-    currentBrightness = 100;
+    currentBrightness = 0;
+    matrix.setBrightness8(0);
 
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
@@ -778,11 +605,12 @@ extern "C" void app_main(void) {
         if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
             ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
         } else {
-            ESP_LOGI(BOOT_TAG, "Illuminance: %" PRIu32 " Lux", lux);
-            if (lux > 0) {
-                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithoutOverwrite);
+            if (lux > 10) {
+                desiredBrightness = 100;
+            } else if(lux > 0) {
+                desiredBrightness = 50;
             } else {
-                xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithoutOverwrite);
+                desiredBrightness = 0;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1000));

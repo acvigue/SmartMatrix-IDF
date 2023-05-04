@@ -3,3 +3,4 @@ build
 certs/*
 sdkconfig.old
 partition_table
+main/secrets.h
