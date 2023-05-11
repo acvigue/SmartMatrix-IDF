@@ -341,16 +341,6 @@ void Worker_Task(void *arg) {
                             if (currentWorkItem.workItemInteger == 1) {
                                 int currentSpriteID = atoi(currentWorkItem.workItemString);
                                 scheduledItems[currentSpriteID].reported_error = false;
-
-                                char resp[200];
-                                char tmpTopic[200];
-                                snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
-
-                                int nextSpriteID = (scheduledItems[currentSpriteID + 1].show_duration > 0) ? currentSpriteID + 1 : 0;
-
-                                snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d}", currentSpriteID,
-                                         nextSpriteID);
-                                esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                             }
                         } else {
                             ESP_LOGE(WORKER_TAG, "file %s has invalid header!", filePath);
@@ -532,7 +522,7 @@ void Schedule_Task(void *arg) {
 
         if (scheduledItems[0].show_duration == 0) {
             // we don't have a schedule? or no sprites in the schedule.
-            const char* resp = "{\"type\": \"get_schedule\"}";
+            const char *resp = "{\"type\": \"get_schedule\"}";
             char tmpTopic[200];
             snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
             esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
@@ -563,6 +553,23 @@ void Schedule_Task(void *arg) {
             xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
             currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
 
+            int nextSpriteID = currentlyDisplayingSprite + 1;
+            while (true) {
+                if (scheduledItems[nextSpriteID].show_duration == 0) {
+                    nextSpriteID = 0;
+                }
+                if (scheduledItems[nextSpriteID].is_skipped == false) {
+                    break;
+                }
+                nextSpriteID++;
+            }
+
+            char resp[200];
+            char tmpTopic[200];
+            snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
+            snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d}", currentlyDisplayingSprite, nextSpriteID);
+            esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+
             needToSkip = false;
         }
     }
@@ -587,6 +594,7 @@ extern "C" void app_main(void) {
         .format_if_mount_failed = true,
         .dont_mount = false,
     };
+    
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 
     ESP_ERROR_CHECK(i2cdev_init());
