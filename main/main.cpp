@@ -256,15 +256,20 @@ void MqttMsg_Task(void *arg) {
 
                     size_t oLen;
                     int decoded = mbedtls_base64_decode(tmpBuf, spriteSize, &oLen, (uint8_t *)encData, encodedSpriteSize);
-                    ESP_LOGI(MQTT_TASK_TAG, "for sprite %d (size %d) (decoded %d)", spriteID, spriteSize, decoded);
+                    if (decoded == 0) {
+                        ESP_LOGI(MQTT_TASK_TAG, "for sprite %d (size %d)", spriteID, spriteSize);
 
-                    // notify the worker task to store the new sprite!
-                    workItem newWorkItem;
-                    sprintf(newWorkItem.workItemString, "%d", spriteID);
-                    newWorkItem.workItemInteger = spriteSize;
-                    newWorkItem.workItemType = WorkItemType::STORE_RECEIVED_SPRITE;
-                    newWorkItem.pArg = (void *)tmpBuf;
-                    xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                        // notify the worker task to store the new sprite!
+                        workItem newWorkItem;
+                        sprintf(newWorkItem.workItemString, "%d", spriteID);
+                        newWorkItem.workItemInteger = spriteSize;
+                        newWorkItem.workItemType = WorkItemType::STORE_RECEIVED_SPRITE;
+                        newWorkItem.pArg = (void *)tmpBuf;
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                    } else {
+                        ESP_LOGE(MQTT_TASK_TAG, "couldn't b64decode sprite %d (size %d)", spriteID, spriteSize);
+                        heap_caps_free(tmpBuf);
+                    }
 
                     cJSON_Delete(spriteDeliveryDoc);
                 } else if (strstr(currentMessage.topic, "schedule_delivery") != NULL) {
@@ -288,7 +293,7 @@ void MqttMsg_Task(void *arg) {
                 }
 
                 // when we're done w/ the message, free it
-                free((void *)currentMessage.pMessage);
+                heap_caps_free((void *)currentMessage.pMessage);
             }
         } else {
             break;
@@ -309,10 +314,52 @@ void Worker_Task(void *arg) {
         if (xWorkerQueue != NULL) {
             if (xQueueReceive(xWorkerQueue, &(currentWorkItem), pdMS_TO_TICKS(1000)) == pdPASS) {
                 if (currentWorkItem.workItemType == WorkItemType::SHOW_SPRITE) {
-                    char filePath[40];
-                    snprintf(filePath, 40, "/fs/%s.webp", currentWorkItem.workItemString);
-                    struct stat st;
-                    if (stat(filePath, &st) == 0) {
+                    if (currentWorkItem.workItemInteger == 1) {
+                        // RAM sprite
+                        int spriteID = atoi(currentWorkItem.workItemString);
+                        ESP_LOGI(WORKER_TAG, "showing RAM sprite at index %d", spriteID);
+                        if (scheduledItems[spriteID].pData == nullptr) {
+                            ESP_LOGE(WORKER_TAG, "cannot copy buf from nullptr for sprite %d", spriteID);
+
+                            if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
+                                scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
+
+                                ESP_LOGE(WORKER_TAG, "reporting error for %d", spriteID);
+                                char resp[200];
+                                char tmpTopic[200];
+                                snprintf(tmpTopic, 200, "smartmatrix/%s/error", thing_name);
+                                snprintf(resp, 200, "{\"spriteID\":%d, \"reason\":\"not_found\"}", atoi(currentWorkItem.workItemString));
+                                esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
+
+                                xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
+                            }
+
+                            continue;
+                        }
+
+                        ESP_LOGI(WORKER_TAG, "sprite %d found in memory: %d length", spriteID, scheduledItems[spriteID].dataLen);
+
+                        xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_NOT_READY, eSetValueWithOverwrite);
+                        WebPDataClear(&webPData);
+
+                        // setup webp buffer and populate from temporary buffer
+                        webPData.size = scheduledItems[spriteID].dataLen;
+                        webPData.bytes = (uint8_t *)heap_caps_malloc(webPData.size, MALLOC_CAP_SPIRAM);
+
+                        // Fill buffer!
+                        memcpy((void *)webPData.bytes, scheduledItems[spriteID].pData, webPData.size);
+                    } else {
+                        // FS sprite
+                        ESP_LOGI(WORKER_TAG, "showing FS sprite: '%s'", currentWorkItem.workItemString);
+
+                        char filePath[40];
+                        snprintf(filePath, 40, "/fs/%s.webp", currentWorkItem.workItemString);
+                        struct stat st;
+                        if (stat(filePath, &st) != 0) {
+                            ESP_LOGE(WORKER_TAG, "couldn't find file %s", filePath);
+                            continue;
+                        }
+
                         FILE *f = fopen(filePath, "r");
 
                         // Set buffers
@@ -331,81 +378,32 @@ void Worker_Task(void *arg) {
                         // Fill buffer!
                         fread((void *)webPData.bytes, 1, fileSize, f);
                         fclose(f);
+                    }
 
-                        // Show!
-                        if (strncmp((const char *)webPData.bytes, "RIFF", 4) == 0) {
-                            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY, eSetValueWithOverwrite);
-                            ESP_LOGI(WORKER_TAG, "showing sprite %s", currentWorkItem.workItemString);
-
-                            // this is a sprite
-                            if (currentWorkItem.workItemInteger == 1) {
-                                int currentSpriteID = atoi(currentWorkItem.workItemString);
-                                scheduledItems[currentSpriteID].reported_error = false;
-                            }
-                        } else {
-                            ESP_LOGE(WORKER_TAG, "file %s has invalid header!", filePath);
-
-                            // this is a sprite
-                            if (currentWorkItem.workItemInteger == 1) {
-                                if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
-                                    scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
-
-                                    char resp[200];
-                                    char tmpTopic[200];
-                                    snprintf(tmpTopic, 200, "smartmatrix/%s/error", thing_name);
-                                    snprintf(resp, 200, "{\"spriteID\":%d, \"reason\":\"parse_error\"}", atoi(currentWorkItem.workItemString));
-                                    esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-
-                                    xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
-                                }
-                            }
-                        }
-                    } else {
-                        ESP_LOGE(WORKER_TAG, "couldn't find file %s", filePath);
-
-                        // this is a sprite
-                        if (currentWorkItem.workItemInteger == 1) {
-                            if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
-                                scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
-
-                                char resp[200];
-                                char tmpTopic[200];
-                                snprintf(tmpTopic, 200, "smartmatrix/%s/error", thing_name);
-                                snprintf(resp, 200, "{\"spriteID\":%d, \"reason\":\"not_found\"}", atoi(currentWorkItem.workItemString));
-                                esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-
-                                xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
-                            }
-                        }
+                    if (strncmp((const char *)webPData.bytes, "RIFF", 4) == 0) {
+                        xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY, eSetValueWithOverwrite);
                     }
                 } else if (currentWorkItem.workItemType == WorkItemType::STORE_RECEIVED_SPRITE) {
-                    ESP_LOGI(WORKER_TAG, "storing the sprite!");
                     int spriteID = atoi((const char *)currentWorkItem.workItemString);
                     size_t spriteSize = currentWorkItem.workItemInteger;
                     uint8_t *buf = (uint8_t *)currentWorkItem.pArg;
 
-                    ESP_LOGD(WORKER_TAG, ".. sprite delivery for %d!", spriteID);
+                    ESP_LOGI(WORKER_TAG, "putting sprite %d into RAM, %d bytes", spriteID, spriteSize);
 
-                    char filePath[40];
-                    snprintf(filePath, 40, "/fs/%d.webp", spriteID);
-                    struct stat st;
-                    if (stat(filePath, &st) == 0) {
-                        unlink(filePath);
+                    // reset buffers if necessary
+                    if (scheduledItems[spriteID].pData != nullptr) {
+                        heap_caps_free(scheduledItems[spriteID].pData);
+                        scheduledItems[spriteID].pData = nullptr;
+                        scheduledItems[spriteID].dataLen = 0;
                     }
 
-                    ESP_LOGD(WORKER_TAG, "opening %s for writing", filePath);
-                    FILE *f = fopen(filePath, "w");
-                    if (f != NULL) {
-                        uint8_t wtf[2];
-                        fwrite((buf) ?: wtf, 1, spriteSize, f);
-                        fclose(f);
-                        ESP_LOGI(WORKER_TAG, "wrote %d bytes", spriteSize);
-                    } else {
-                        ESP_LOGE(WORKER_TAG, "couldn't open %s for writing!", filePath);
-                    }
+                    scheduledItems[spriteID].dataLen = spriteSize;
+                    scheduledItems[spriteID].pData = (uint8_t *)heap_caps_malloc(spriteSize, MALLOC_CAP_SPIRAM);
+                    memcpy((void *)scheduledItems[spriteID].pData, buf, spriteSize);
+                    ESP_LOGI(WORKER_TAG, "put %d bytes", spriteSize);
 
                     // this job is complete, we can mark it
-                    free(buf);
+                    heap_caps_free(buf);
 
                     // show if we're currently showing it already
                     if (currentlyDisplayingSprite == spriteID) {
@@ -514,7 +512,7 @@ void Schedule_Task(void *arg) {
     uint32_t notifiedValue;
 
     while (1) {
-        if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(1000))) {
+        if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(5000))) {
             if (notifiedValue == SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT) {
                 needToSkip = true;
             }
@@ -594,7 +592,7 @@ extern "C" void app_main(void) {
         .format_if_mount_failed = true,
         .dont_mount = false,
     };
-    
+
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 
     ESP_ERROR_CHECK(i2cdev_init());

@@ -55,6 +55,8 @@ typedef struct scheduledItem {
     bool is_pinned;
     bool is_skipped;
     bool reported_error;
+    uint8_t *pData = nullptr;
+    size_t dataLen;
 } scheduledItem;
 
 typedef struct workItem {
