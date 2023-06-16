@@ -431,9 +431,12 @@ void Matrix_Task(void *arg) {
     while (1) {
         if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(16))) {
             if (notifiedValue == MATRIX_TASK_NOTIF_NOT_READY) {
-                WebPAnimDecoderDelete(dec);
                 isReady = false;
             } else if (notifiedValue == MATRIX_TASK_NOTIF_READY) {
+                if(dec != nullptr) {
+                    WebPAnimDecoderDelete(dec);
+                    dec = nullptr;
+                }
                 dec = WebPAnimDecoderNew(&webPData, NULL);
                 if (dec == NULL) {
                     ESP_LOGE(MATRIX_TAG, "we cannot decode with a null animdec!!!");
