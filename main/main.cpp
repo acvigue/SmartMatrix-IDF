@@ -27,8 +27,6 @@ esp_mqtt_client_handle_t mqttClient;
 
 scheduledItem *scheduledItems = nullptr;
 
-char thing_name[18];
-
 QueueHandle_t xWorkerQueue, xMqttMessageQueue;
 TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask;
 TimerHandle_t tslTimer, brightnessTimer;
@@ -38,6 +36,7 @@ HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
 MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
 tsl2561_t tslSensor;
 
+char thing_name[18];
 int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -525,7 +524,7 @@ void Schedule_Task(void *arg) {
             }
         }
 
-        if (scheduledItems[0].show_duration == 0) {
+        if (scheduledItems[0].show_duration == 0 && mqttClient) {
             // we don't have a schedule? or no sprites in the schedule.
             const char *resp = "{\"type\": \"get_schedule\"}";
             char tmpTopic[200];
@@ -566,6 +565,7 @@ void Schedule_Task(void *arg) {
                 if (scheduledItems[nextSpriteID].is_skipped == false) {
                     break;
                 }
+                ESP_LOGI(SCHEDULE_TAG, "skipping %d", nextSpriteID);
                 nextSpriteID++;
             }
 
@@ -641,13 +641,11 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    uint32_t lux;
-    esp_err_t res;
     /*
     while (1) {
-        if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
-            ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
-        } else {
+        uint32_t lux;
+        esp_err_t res;
+        if ((res = tsl2561_read_lux(&tslSensor, &lux)) == ESP_OK) {
             if (lux > 5) {
                 desiredBrightness = 100;
             } else if (lux > 0) {
