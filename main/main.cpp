@@ -1,6 +1,5 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <cJSON.h>
-#include <esp_crt_bundle.h>
 #include <esp_event.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
@@ -37,7 +36,7 @@ TimerHandle_t tslTimer, brightnessTimer;
 HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
 HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
 MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
-tsl2561_t tslSensor = {0};
+tsl2561_t tslSensor;
 
 int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
 
@@ -50,7 +49,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(MQTT_TAG, "connected to iot core..");
+            ESP_LOGI(MQTT_TAG, "connected to broker..");
             failureCount = 0;
 
             // Device shadow topics.
@@ -70,7 +69,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "ready");
-                xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                xQueueSendToFront(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 hasConnected = true;
             }
 
@@ -197,7 +196,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     } else if (event_base == IP_EVENT) {
         if (event_id == IP_EVENT_STA_GOT_IP) {
             wifiConnectionAttempts = 0;
-            ESP_LOGI(WIFI_TAG, "STA connected!");
+            ESP_LOGI(WIFI_TAG, "STA connected, starting MQTT connection");
 
             workItem newWorkItem;
             newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
@@ -243,7 +242,6 @@ void MqttMsg_Task(void *arg) {
             if (xQueueReceive(xMqttMessageQueue, &(currentMessage), pdMS_TO_TICKS(1000)) == pdPASS) {
                 ESP_LOGD(MQTT_TASK_TAG, "got item from queue!");
                 if (strstr(currentMessage.topic, "sprite_delivery") != NULL) {
-                    ESP_LOGI(MQTT_TASK_TAG, "we got a sprite delivery!");
                     cJSON *spriteDeliveryDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
 
                     // jobDocument has (spriteID: int, spriteHash: string (33), spriteSize: int, data: string (spriteSize))
@@ -257,7 +255,7 @@ void MqttMsg_Task(void *arg) {
                     size_t oLen;
                     int decoded = mbedtls_base64_decode(tmpBuf, spriteSize, &oLen, (uint8_t *)encData, encodedSpriteSize);
                     if (decoded == 0) {
-                        ESP_LOGI(MQTT_TASK_TAG, "for sprite %d (size %d)", spriteID, spriteSize);
+                        ESP_LOGI(MQTT_TASK_TAG, "incoming delivery for sprite %d (len %d)", spriteID, spriteSize);
 
                         // notify the worker task to store the new sprite!
                         workItem newWorkItem;
@@ -267,7 +265,6 @@ void MqttMsg_Task(void *arg) {
                         newWorkItem.pArg = (void *)tmpBuf;
                         xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                     } else {
-                        ESP_LOGE(MQTT_TASK_TAG, "couldn't b64decode sprite %d (size %d)", spriteID, spriteSize);
                         heap_caps_free(tmpBuf);
                     }
 
@@ -277,6 +274,7 @@ void MqttMsg_Task(void *arg) {
 
                     if (schedule != nullptr) {
                         int itemCount = cJSON_GetArraySize(schedule);
+                        ESP_LOGI(MQTT_TASK_TAG, "received new schedule with %d items", itemCount);
                         for (int i = 0; i < itemCount; i++) {
                             cJSON *item = cJSON_GetArrayItem(schedule, i);
                             int itemDuration = cJSON_GetObjectItem(item, "duration")->valueint;
@@ -324,7 +322,7 @@ void Worker_Task(void *arg) {
                             if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
 
-                                ESP_LOGE(WORKER_TAG, "reporting error for %d", spriteID);
+                                ESP_LOGD(WORKER_TAG, "reporting error for %d", spriteID);
                                 char resp[200];
                                 char tmpTopic[200];
                                 snprintf(tmpTopic, 200, "smartmatrix/%s/error", thing_name);
@@ -337,7 +335,7 @@ void Worker_Task(void *arg) {
                             continue;
                         }
 
-                        ESP_LOGI(WORKER_TAG, "sprite %d found in memory: %d length", spriteID, scheduledItems[spriteID].dataLen);
+                        ESP_LOGD(WORKER_TAG, "sprite %d found in memory: %d length", spriteID, scheduledItems[spriteID].dataLen);
 
                         xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_NOT_READY, eSetValueWithOverwrite);
                         WebPDataClear(&webPData);
@@ -388,10 +386,13 @@ void Worker_Task(void *arg) {
                     size_t spriteSize = currentWorkItem.workItemInteger;
                     uint8_t *buf = (uint8_t *)currentWorkItem.pArg;
 
-                    ESP_LOGI(WORKER_TAG, "putting sprite %d into RAM, %d bytes", spriteID, spriteSize);
+                    ESP_LOGD(WORKER_TAG, "putting sprite %d into RAM, %d bytes", spriteID, spriteSize);
 
                     // reset buffers if necessary
                     if (scheduledItems[spriteID].pData != nullptr) {
+                        //free ptr cause RTOS will leak otherwise :(
+                        //!!!this should be done in libwebp!!!
+                        //^but it just doesnt work!
                         heap_caps_free(scheduledItems[spriteID].pData);
                         scheduledItems[spriteID].pData = nullptr;
                         scheduledItems[spriteID].dataLen = 0;
@@ -434,12 +435,14 @@ void Matrix_Task(void *arg) {
                 isReady = false;
             } else if (notifiedValue == MATRIX_TASK_NOTIF_READY) {
                 if(dec != nullptr) {
+                    ESP_LOGD(MATRIX_TAG, "recreating decoder");
                     WebPAnimDecoderDelete(dec);
                     dec = nullptr;
                 }
                 dec = WebPAnimDecoderNew(&webPData, NULL);
                 if (dec == NULL) {
                     ESP_LOGE(MATRIX_TAG, "we cannot decode with a null animdec!!!");
+                    xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
                     continue;
                 }
                 animStartTS = pdTICKS_TO_MS(xTaskGetTickCount());
@@ -482,6 +485,7 @@ void Matrix_Task(void *arg) {
                         }
                     } else {
                         ESP_LOGE(MATRIX_TAG, "we cannot get the next frame!");
+                        xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
                         isReady = false;
                     }
                 }
@@ -580,6 +584,7 @@ extern "C" void app_main(void) {
     /* Start the matrix */
     matrix.begin();
     currentBrightness = 0;
+    desiredBrightness = 255;
     matrix.setBrightness8(0);
 
     /* Initialize NVS partition */
@@ -600,10 +605,8 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(i2cdev_init());
 
-    ESP_ERROR_CHECK(tsl2561_init_desc(&tslSensor, 0x39, 0, (gpio_num_t)3, (gpio_num_t)0));
-    ESP_ERROR_CHECK(tsl2561_init(&tslSensor));
-
-    ESP_LOGI(BOOT_TAG, "Found TSL2561 in package %s", tslSensor.package_type == TSL2561_PACKAGE_CS ? "CS" : "T/FN/CL");
+    tsl2561_init_desc(&tslSensor, 0x39, (i2c_port_t) 0, (gpio_num_t)3, (gpio_num_t)0);
+    tsl2561_init(&tslSensor);
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
     xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 3500, NULL, 5, &mqttMsgTask, 1);
@@ -640,6 +643,7 @@ extern "C" void app_main(void) {
 
     uint32_t lux;
     esp_err_t res;
+    /*
     while (1) {
         if ((res = tsl2561_read_lux(&tslSensor, &lux)) != ESP_OK) {
             ESP_LOGI(BOOT_TAG, "Could not read illuminance value: %d (%s)", res, esp_err_to_name(res));
@@ -654,4 +658,5 @@ extern "C" void app_main(void) {
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+    */
 }
