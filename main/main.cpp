@@ -379,6 +379,9 @@ void Worker_Task(void *arg) {
 
                     if (strncmp((const char *)webPData.bytes, "RIFF", 4) == 0) {
                         xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_READY, eSetValueWithOverwrite);
+                    } else {
+                        ESP_LOGE(WORKER_TAG, "magic bytes corrupt, skipping");
+                        xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
                     }
                 } else if (currentWorkItem.workItemType == WorkItemType::STORE_RECEIVED_SPRITE) {
                     int spriteID = atoi((const char *)currentWorkItem.workItemString);
