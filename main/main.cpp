@@ -644,7 +644,6 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /*
     while (1) {
         uint32_t lux;
         esp_err_t res;
@@ -659,5 +658,4 @@ extern "C" void app_main(void) {
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    */
 }
