@@ -1,4 +1,0 @@
-key,type,encoding,value
-certs,namespace,,
-client_cert,file,string,../certs/client.crt
-client_key,file,string,../certs/client.key
