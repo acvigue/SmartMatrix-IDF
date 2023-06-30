@@ -1,0 +1,29 @@
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        submodules: 'recursive'
+    - uses: "finnp/create-file-action@master"
+      env:
+        FILE_NAME: "main/secrets.h"
+        FILE_BASE64: "I2lmbmRlZiBTRUNSRVRTX0gKI2RlZmluZSBTRUNSRVRTX0gKCiNkZWZpbmUgTVFUVF9IT1NUICIiCiNkZWZpbmUgTVFUVF9VU0VSTkFNRSAiIgojZGVmaW5lIE1RVFRfUEFTU1dPUkQgIiIKI2VuZGlm"
+    - name: esp-idf build
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: latest
+        target: esp32s3
+        path: './'
