@@ -26,5 +26,5 @@
         "board/esp32s3-builtin.cfg"
     ],
     "idf.flashType": "UART",
-    "idf.port": "/dev/cu.usbmodem101",
+    "idf.port": "/dev/cu.usbmodem1101",
 }

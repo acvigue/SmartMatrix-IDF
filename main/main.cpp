@@ -608,7 +608,7 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(i2cdev_init());
 
-    tsl2561_init_desc(&tslSensor, 0x39, (i2c_port_t) 0, (gpio_num_t)3, (gpio_num_t)0);
+    tsl2561_init_desc(&tslSensor, 0x39, (i2c_port_t) 0, (gpio_num_t)7, (gpio_num_t)6);
     tsl2561_init(&tslSensor);
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
