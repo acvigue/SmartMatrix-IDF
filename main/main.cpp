@@ -64,6 +64,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             sprintf(tmpTopic, "smartmatrix/%s/status", thing_name);
             esp_mqtt_client_publish(event->client, tmpTopic, "{\"type\":\"get_schedule\"}", 0, 0, false);
 
+            // Sub to receive command
+            sprintf(tmpTopic, "smartmatrix/%s/command", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+
             if (!hasConnected) {
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
@@ -305,6 +309,27 @@ void MqttMsg_Task(void *arg) {
                     }
 
                     cJSON_Delete(schedule);
+                } 
+                // MQTT commands
+                else if (strstr(currentMessage.topic, "command") != NULL) {
+                    cJSON *cmd = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
+                    const char* command = cJSON_GetObjectItem(cmd, "command")->valuestring;
+                    if (strstr(command, "sleep") != NULL) { // display a blank WebP
+                        ESP_LOGI(MQTT_TASK_TAG, "we need to sleep");
+                                    workItem newWorkItem;
+                        newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                        strcpy(newWorkItem.workItemString, "sleep");
+                        xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+
+                    }
+                    if (strstr(command, "reset_wifi") != NULL) { //Reset Provisioning manager
+                                                        wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble,
+                                                         .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+                        ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+                        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
+                    
+                    }
+                    cJSON_Delete(cmd);
                 }
 
                 // when we're done w/ the message, free it
