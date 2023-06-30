@@ -4,3 +4,5 @@ certs/*
 sdkconfig.old
 partition_table
 main/secrets.h
+.vscode/settings.json
+.vscode/c_cpp_properties.json

@@ -27,4 +27,5 @@
     ],
     "idf.flashType": "UART",
     "idf.port": "/dev/cu.usbmodem1101",
+    "git.ignoreLimitWarning": true,
 }

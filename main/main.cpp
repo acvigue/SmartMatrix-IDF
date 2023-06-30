@@ -47,7 +47,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     static bool hasConnected = false;
 
     switch ((esp_mqtt_event_id_t)event_id) {
-        case MQTT_EVENT_CONNECTED:
+        case MQTT_EVENT_CONNECTED: {
             ESP_LOGI(MQTT_TAG, "connected to broker..");
             failureCount = 0;
 
@@ -64,15 +64,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             sprintf(tmpTopic, "smartmatrix/%s/status", thing_name);
             esp_mqtt_client_publish(event->client, tmpTopic, "{\"type\":\"get_schedule\"}", 0, 0, false);
 
-            if (!hasConnected) {
-                workItem newWorkItem;
-                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
-                strcpy(newWorkItem.workItemString, "ready");
-                xQueueSendToFront(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                hasConnected = true;
-            }
+            workItem newWorkItem;
+            newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+            strcpy(newWorkItem.workItemString, "ready");
+            xQueueSendToFront(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
 
             break;
+        }
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
             failureCount++;
@@ -117,47 +115,54 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
     if (event_base == WIFI_PROV_EVENT) {
         switch (event_id) {
-            case WIFI_PROV_CRED_FAIL:
+            case WIFI_PROV_CRED_FAIL: {
                 ESP_LOGE(PROV_TAG, "provisioning error");
-                
+
+                workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "cred_failed");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 wifi_prov_mgr_reset_sm_state_on_failure();
-                
+
                 break;
-            case WIFI_PROV_CRED_SUCCESS:
+            }
+            case WIFI_PROV_CRED_SUCCESS: {
                 ESP_LOGI(PROV_TAG, "provisioning successful");
                 provisioned = true;
-                
+
                 break;
-            case WIFI_PROV_END:
+            }
+            case WIFI_PROV_END: {
                 provisioning = false;
                 ESP_LOGI(PROV_TAG, "provisioning end");
                 wifi_prov_mgr_deinit();
                 break;
-            case WIFI_PROV_START:
+            }
+            case WIFI_PROV_START: {
                 provisioning = true;
                 ESP_LOGI(PROV_TAG, "provisioning started");
-                
+
+                workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "setup_wifi");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 break;
-
-            case WIFI_PROV_CRED_RECV: 
+            }
+            case WIFI_PROV_CRED_RECV: {
                 wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
-                
+
+                workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "check_cred");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                ESP_LOGI(PROV_TAG, "Received Wi-Fi credentials"
+                ESP_LOGI(PROV_TAG,
+                         "Received Wi-Fi credentials"
                          "\n\tSSID     : %s\n\tPassword : %s",
-                         (const char *) wifi_sta_cfg->ssid,
-                         (const char *) wifi_sta_cfg->password);
+                         (const char *)wifi_sta_cfg->ssid, (const char *)wifi_sta_cfg->password);
                 break;
-            
-        } else if (event_base == WIFI_EVENT) {
+            }
+        }
+    } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
             case WIFI_EVENT_STA_START: {
                 ESP_LOGI(WIFI_TAG, "STA started");
@@ -410,7 +415,7 @@ void Worker_Task(void *arg) {
 
                     // reset buffers if necessary
                     if (scheduledItems[spriteID].pData != nullptr) {
-                        //free ptr cause RTOS will leak otherwise :(
+                        // free ptr cause RTOS will leak otherwise :(
                         //!!!this should be done in libwebp!!!
                         //^but it just doesnt work!
                         heap_caps_free(scheduledItems[spriteID].pData);
@@ -454,7 +459,7 @@ void Matrix_Task(void *arg) {
             if (notifiedValue == MATRIX_TASK_NOTIF_NOT_READY) {
                 isReady = false;
             } else if (notifiedValue == MATRIX_TASK_NOTIF_READY) {
-                if(dec != nullptr) {
+                if (dec != nullptr) {
                     ESP_LOGD(MATRIX_TAG, "recreating decoder");
                     WebPAnimDecoderDelete(dec);
                     dec = nullptr;
@@ -626,7 +631,7 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(i2cdev_init());
 
-    tsl2561_init_desc(&tslSensor, 0x39, (i2c_port_t) 0, (gpio_num_t)7, (gpio_num_t)6);
+    tsl2561_init_desc(&tslSensor, 0x39, (i2c_port_t)0, (gpio_num_t)7, (gpio_num_t)6);
     tsl2561_init(&tslSensor);
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
