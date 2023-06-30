@@ -119,11 +119,17 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         switch (event_id) {
             case WIFI_PROV_CRED_FAIL:
                 ESP_LOGE(PROV_TAG, "provisioning error");
+                
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                strcpy(newWorkItem.workItemString, "cred_failed");
+                xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 wifi_prov_mgr_reset_sm_state_on_failure();
+                
                 break;
             case WIFI_PROV_CRED_SUCCESS:
                 ESP_LOGI(PROV_TAG, "provisioning successful");
                 provisioned = true;
+                
                 break;
             case WIFI_PROV_END:
                 provisioning = false;
@@ -133,13 +139,25 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             case WIFI_PROV_START:
                 provisioning = true;
                 ESP_LOGI(PROV_TAG, "provisioning started");
-                workItem newWorkItem;
+                
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
-                strcpy(newWorkItem.workItemString, "setup");
+                strcpy(newWorkItem.workItemString, "setup_wifi");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 break;
-        }
-    } else if (event_base == WIFI_EVENT) {
+
+            case WIFI_PROV_CRED_RECV: 
+                wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
+                
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                strcpy(newWorkItem.workItemString, "check_cred");
+                xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                ESP_LOGI(PROV_TAG, "Received Wi-Fi credentials"
+                         "\n\tSSID     : %s\n\tPassword : %s",
+                         (const char *) wifi_sta_cfg->ssid,
+                         (const char *) wifi_sta_cfg->password);
+                break;
+            
+        } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
             case WIFI_EVENT_STA_START: {
                 ESP_LOGI(WIFI_TAG, "STA started");
