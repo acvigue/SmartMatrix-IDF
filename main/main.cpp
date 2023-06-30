@@ -138,6 +138,12 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                 strcpy(newWorkItem.workItemString, "setup");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 break;
+            case WIFI_PROV_CRED_RECV: 
+                ESP_LOGI(PROV_TAG, "Received Wi-Fi credentials"
+                         "\n\tSSID     : %s\n\tPassword : %s",
+                         (const char *) wifi_sta_cfg->ssid,
+                         (const char *) wifi_sta_cfg->password);
+                break;
         }
     } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
@@ -618,6 +624,8 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
 
+    
+
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
@@ -626,16 +634,44 @@ extern "C" void app_main(void) {
 
     esp_netif_t *netif = esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble,
+    .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+     ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
+    
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(wifi_mode_t::WIFI_MODE_STA));
-
+    bool provisioned = false;
+    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
     esp_netif_set_hostname(netif, thing_name);
 
     char device_id[7];
     uint8_t eth_mac[6];
     esp_wifi_get_mac(WIFI_IF_STA, eth_mac);
     snprintf(device_id, 7, "%02X%02X%02X", eth_mac[3], eth_mac[4], eth_mac[5]);
-    snprintf(thing_name, 18, "SmartMatrix%s", device_id);
+    snprintf(thing_name, 23, "PROV_SmartMatrix%s", device_id);
+    
+    if (!provisioned) {
+        ESP_LOGI(PROV_TAG, "Starting provisioning");
+
+        /* What is the Device Service Name that we want
+         * This translates to :
+         *     - Wi-Fi SSID when scheme is wifi_prov_scheme_softap
+         *     - device name when scheme is wifi_prov_scheme_ble
+         */
+
+        
+        get_device_service_name(service_name, sizeof(service_name));
+        //const char *service_key = NULL;
+        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_0, NULL, thing_name, NULL));
+        
+ } else {
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+ }
+    
+    //ESP_ERROR_CHECK(esp_wifi_set_mode(wifi_mode_t::WIFI_MODE_STA));
+    
+
 
     workItem newWorkItem;
     newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
