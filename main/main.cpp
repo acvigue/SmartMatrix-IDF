@@ -3,6 +3,8 @@
 #include <esp_app_desc.h>
 #include <esp_crt_bundle.h>
 #include <esp_event.h>
+#include <esp_http_client.h>
+#include <esp_https_ota.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -60,6 +62,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
             sprintf(tmpTopic, "smartmatrix/%s/sprite_delivery", thing_name);
+            esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
+
+            sprintf(tmpTopic, "smartmatrix/%s/command", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
             // Request to get the initial shadow state
@@ -310,6 +315,38 @@ void MqttMsg_Task(void *arg) {
                     }
 
                     cJSON_Delete(schedule);
+                } else if (strstr(currentMessage.topic, "command") != NULL) {
+                    cJSON *commandDoc = cJSON_ParseWithLength(currentMessage.pMessage, currentMessage.messageLen);
+
+                    if (commandDoc != nullptr) {
+                        const char *type = cJSON_GetObjectItem(commandDoc, "type")->valuestring;
+                        if (strcmp(type, "sleep") == 0) {
+                            ESP_LOGI(MQTT_TASK_TAG, "got sleep command");
+                            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithOverwrite);
+                        } else if (strcmp(type, "wake") == 0) {
+                            ESP_LOGI(MQTT_TASK_TAG, "got wake up command");
+                            xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithOverwrite);
+                        } else if (strcmp(type, "ota") == 0) {
+                            ESP_LOGI(MQTT_TASK_TAG, "got ota update command");
+                            const char *firmwareURL = cJSON_GetObjectItem(commandDoc, "firmwareURL")->valuestring;
+                            ESP_LOGI(MQTT_TASK_TAG, "fw url: %s, updating...", firmwareURL);
+
+                            esp_http_client_config_t config = {.url = firmwareURL, .crt_bundle_attach = esp_crt_bundle_attach};
+                            esp_https_ota_config_t ota_config = {
+                                .http_config = &config,
+                                .partial_http_download = true
+                            };
+                            esp_err_t ret = esp_https_ota(&ota_config);
+                            if (ret == ESP_OK) {
+                                ESP_LOGI(MQTT_TASK_TAG, "ota done, restarting");
+                                esp_restart();
+                            } else {
+                                ESP_LOGE(MQTT_TASK_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
+                            }
+                        }
+                    }
+
+                    cJSON_Delete(commandDoc);
                 }
 
                 // when we're done w/ the message, free it
@@ -607,7 +644,7 @@ void Schedule_Task(void *arg) {
             char resp[200];
             char tmpTopic[200];
             snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
-            const esp_app_desc_t* app_desc = esp_app_get_description();
+            const esp_app_desc_t *app_desc = esp_app_get_description();
             snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d, \"appVersion\": \"%s\"}",
                      currentlyDisplayingSprite, nextSpriteID, app_desc->version);
             esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
