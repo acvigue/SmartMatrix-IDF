@@ -1,5 +1,7 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <cJSON.h>
+#include <esp_app_desc.h>
+#include <esp_crt_bundle.h>
 #include <esp_event.h>
 #include <esp_littlefs.h>
 #include <esp_log.h>
@@ -63,12 +65,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // Request to get the initial shadow state
             sprintf(tmpTopic, "smartmatrix/%s/status", thing_name);
             esp_mqtt_client_publish(event->client, tmpTopic, "{\"type\":\"get_schedule\"}", 0, 0, false);
-
-            workItem newWorkItem;
-            newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
-            strcpy(newWorkItem.workItemString, "ready");
-            xQueueSendToFront(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-
+            if (!hasConnected) {
+                workItem newWorkItem;
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                strcpy(newWorkItem.workItemString, "ready");
+                xQueueSendToFront(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                hasConnected = true;
+            }
             break;
         }
         case MQTT_EVENT_DISCONNECTED:
@@ -227,10 +230,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
             /* Setup MQTT */
             const esp_mqtt_client_config_t mqtt_cfg = {
-                .broker =
-                    {
-                        .address = MQTT_HOST,
-                    },
+                .broker = {.address = MQTT_HOST, .verification = {.crt_bundle_attach = esp_crt_bundle_attach}},
                 .credentials = {.username = MQTT_USERNAME, .client_id = thing_name, .authentication = {.password = MQTT_PASSWORD}},
                 .network =
                     {
@@ -415,9 +415,6 @@ void Worker_Task(void *arg) {
 
                     // reset buffers if necessary
                     if (scheduledItems[spriteID].pData != nullptr) {
-                        // free ptr cause RTOS will leak otherwise :(
-                        //!!!this should be done in libwebp!!!
-                        //^but it just doesnt work!
                         heap_caps_free(scheduledItems[spriteID].pData);
                         scheduledItems[spriteID].pData = nullptr;
                         scheduledItems[spriteID].dataLen = 0;
@@ -532,6 +529,7 @@ void Schedule_Task(void *arg) {
     /* Initialize the scheduler items */
     scheduledItems = new scheduledItem[100];
     unsigned long long currentSpriteStartTime = 0;
+    unsigned long long lastScheduleRequestTime = 0;
     bool needToSkip = false;
 
     for (int i = 0; i < 100; i++) {
@@ -544,21 +542,32 @@ void Schedule_Task(void *arg) {
     uint32_t notifiedValue;
 
     while (1) {
-        if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(5000))) {
+        if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(1000))) {
             if (notifiedValue == SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT) {
                 needToSkip = true;
             }
         }
 
-        if (scheduledItems[0].show_duration == 0 && mqttClient) {
-            // we don't have a schedule? or no sprites in the schedule.
+        if (!mqttClient) {
+            continue;
+        }
+
+        if (scheduledItems[0].show_duration == 0 || (pdTICKS_TO_MS(xTaskGetTickCount()) - lastScheduleRequestTime > (60 * 5 * 1000))) {
+            // we don't have a schedule? or schedule is outdated
             const char *resp = "{\"type\": \"get_schedule\"}";
             char tmpTopic[200];
             snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
             esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
-            continue;
+            ESP_LOGI(SCHEDULE_TAG, "requesting latest schedule..");
+            lastScheduleRequestTime = pdTICKS_TO_MS(xTaskGetTickCount());
+
+            // only skip loop if no schedule at all
+            if (scheduledItems[0].show_duration == 0) {
+                continue;
+            }
         }
 
+        // main schedule loop
         if ((pdTICKS_TO_MS(xTaskGetTickCount()) - currentSpriteStartTime > (scheduledItems[currentlyDisplayingSprite].show_duration * 1000)) ||
             needToSkip) {
             if (scheduledItems[currentlyDisplayingSprite].is_pinned && !needToSkip) {
@@ -591,14 +600,16 @@ void Schedule_Task(void *arg) {
                 if (scheduledItems[nextSpriteID].is_skipped == false) {
                     break;
                 }
-                ESP_LOGI(SCHEDULE_TAG, "skipping %d", nextSpriteID);
+                ESP_LOGI(SCHEDULE_TAG, "skipping sprite #%d", nextSpriteID);
                 nextSpriteID++;
             }
 
             char resp[200];
             char tmpTopic[200];
             snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
-            snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d}", currentlyDisplayingSprite, nextSpriteID);
+            const esp_app_desc_t* app_desc = esp_app_get_description();
+            snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d, \"appVersion\": \"%s\"}",
+                     currentlyDisplayingSprite, nextSpriteID, app_desc->version);
             esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
 
             needToSkip = false;
@@ -635,7 +646,7 @@ extern "C" void app_main(void) {
     tsl2561_init(&tslSensor);
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
-    xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 3500, NULL, 5, &mqttMsgTask, 1);
+    xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 4000, NULL, 5, &mqttMsgTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
 
@@ -663,7 +674,7 @@ extern "C" void app_main(void) {
     workItem newWorkItem;
     newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
     strcpy(newWorkItem.workItemString, "connect_wifi");
-    xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+    xQueueSend(xWorkerQueue, &newWorkItem, portMAX_DELAY);
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
