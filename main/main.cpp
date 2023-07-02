@@ -254,6 +254,22 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     }
 }
 
+void OTA_Task(void *arg) {
+    char *firmwareURL = (char *)arg;
+    ESP_LOGI(OTA_TAG, "ota update task started, firmware URL: %s", firmwareURL);
+
+    esp_http_client_config_t config = {.url = firmwareURL, .crt_bundle_attach = esp_crt_bundle_attach};
+    esp_https_ota_config_t ota_config = {.http_config = &config, .partial_http_download = true};
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(OTA_TAG, "ota done, restarting");
+        esp_restart();
+    } else {
+        ESP_LOGE(OTA_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
+    }
+    free(firmwareURL);
+}
+
 void MqttMsg_Task(void *arg) {
     mqttMessage currentMessage;
 
@@ -321,28 +337,16 @@ void MqttMsg_Task(void *arg) {
                     if (commandDoc != nullptr) {
                         const char *type = cJSON_GetObjectItem(commandDoc, "type")->valuestring;
                         if (strcmp(type, "sleep") == 0) {
-                            ESP_LOGI(MQTT_TASK_TAG, "got sleep command");
+                            ESP_LOGI(MQTT_TASK_TAG, "sleeping");
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithOverwrite);
                         } else if (strcmp(type, "wake") == 0) {
-                            ESP_LOGI(MQTT_TASK_TAG, "got wake up command");
+                            ESP_LOGI(MQTT_TASK_TAG, "waking up");
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithOverwrite);
                         } else if (strcmp(type, "ota") == 0) {
-                            ESP_LOGI(MQTT_TASK_TAG, "got ota update command");
                             const char *firmwareURL = cJSON_GetObjectItem(commandDoc, "firmwareURL")->valuestring;
-                            ESP_LOGI(MQTT_TASK_TAG, "fw url: %s, updating...", firmwareURL);
-
-                            esp_http_client_config_t config = {.url = firmwareURL, .crt_bundle_attach = esp_crt_bundle_attach};
-                            esp_https_ota_config_t ota_config = {
-                                .http_config = &config,
-                                .partial_http_download = true
-                            };
-                            esp_err_t ret = esp_https_ota(&ota_config);
-                            if (ret == ESP_OK) {
-                                ESP_LOGI(MQTT_TASK_TAG, "ota done, restarting");
-                                esp_restart();
-                            } else {
-                                ESP_LOGE(MQTT_TASK_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
-                            }
+                            char *firmwareURLp = (char *)malloc(200);
+                            strcpy(firmwareURLp, firmwareURL);
+                            xTaskCreatePinnedToCore(OTA_Task, "OTA", 5000, (void *)firmwareURLp, 5, NULL, 0);
                         }
                     }
 
@@ -515,6 +519,10 @@ void Matrix_Task(void *arg) {
             }
         }
 
+        if (isSleeping) {
+            desiredBrightness = 0;
+        }
+
         if (isReady) {
             if (pdTICKS_TO_MS(xTaskGetTickCount()) - animStartTS > lastFrameTimestamp) {
                 if (currentFrame == 0) {
@@ -527,15 +535,11 @@ void Matrix_Task(void *arg) {
                     uint8_t *buf;
                     if (WebPAnimDecoderGetNext(dec, &buf, &lastFrameTimestamp)) {
                         int px = 0;
-                        if (!isSleeping) {
-                            for (int y = 0; y < MATRIX_HEIGHT; y++) {
-                                for (int x = 0; x < MATRIX_WIDTH; x++) {
-                                    matrix.drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
-                                    px++;
-                                }
+                        for (int y = 0; y < MATRIX_HEIGHT; y++) {
+                            for (int x = 0; x < MATRIX_WIDTH; x++) {
+                                matrix.drawPixelRGB888(x, y, buf[px * 4], buf[px * 4 + 1], buf[px * 4 + 2]);
+                                px++;
                             }
-                        } else {
-                            matrix.fillScreenRGB888(0, 0, 0);
                         }
                         currentFrame++;
                         if (!WebPAnimDecoderHasMoreFrames(dec)) {
@@ -683,7 +687,7 @@ extern "C" void app_main(void) {
     tsl2561_init(&tslSensor);
 
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
-    xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 4000, NULL, 5, &mqttMsgTask, 1);
+    xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 10000, NULL, 5, &mqttMsgTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
 

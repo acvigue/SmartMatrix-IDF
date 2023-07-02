@@ -15,6 +15,7 @@
 #define WIFI_TAG "[smx/wifi]"
 #define HTTP_TAG "[smx/http]"
 #define SCHEDULE_TAG "[smx/schedule]"
+#define OTA_TAG "[smx/ota]"
 
 /* Inter-task communication values */
 #define MATRIX_TASK_NOTIF_READY 1
