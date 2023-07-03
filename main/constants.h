@@ -16,6 +16,7 @@
 #define HTTP_TAG "[smx/http]"
 #define SCHEDULE_TAG "[smx/schedule]"
 #define OTA_TAG "[smx/ota]"
+#define BUTTON_TAG "[smx/button]"
 
 /* Inter-task communication values */
 #define MATRIX_TASK_NOTIF_READY 1
@@ -23,6 +24,7 @@
 #define MATRIX_TASK_NOTIF_SLEEP 3
 #define MATRIX_TASK_NOTIF_WAKE_UP 4
 #define SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT 1
+#define SCHEDULE_TASK_NOTIF_SKIP_TO_PINNED 2
 
 enum WorkItemType {
     SHOW_SPRITE,
@@ -47,6 +49,9 @@ enum IoTJobOperation { SPRITE_DELIVERY, OTA_UPDATE };
 #define LAT_PIN 16
 #define OE_PIN 17
 #define CLK_PIN 18
+
+#define IO_BTN_USER1 GPIO_NUM_11
+#define IO_BTN_USER2 GPIO_NUM_12
 
 #define STREAM_CHUNK_SIZE 30000
 #define MAX_OPEN_STREAMS 20

@@ -1,4 +1,5 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <button.h>
 #include <cJSON.h>
 #include <esp_app_desc.h>
 #include <esp_crt_bundle.h>
@@ -39,9 +40,32 @@ HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN,
 HUB75_I2S_CFG mxconfig(64, 32, 1, _pins);
 MatrixPanel_I2S_DMA matrix = MatrixPanel_I2S_DMA(mxconfig);
 tsl2561_t tslSensor;
+button_t skip_button, pin_button;
 
 char thing_name[18];
 int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
+
+static void on_button(button_t *btn, button_state_t state) {
+    if (state == BUTTON_PRESSED) {
+        if (btn == &pin_button) {
+            // clear all pin states
+            int i = 0;
+            while (true) {
+                if (scheduledItems[i].show_duration == 0) {
+                    break;
+                }
+                scheduledItems[i].is_pinned = false;
+                i++;
+            }
+
+            ESP_LOGI(BUTTON_TAG, "pin button pressed, pinning current sprite");
+            scheduledItems[currentlyDisplayingSprite].is_pinned = true;
+        } else if (btn == &skip_button) {
+            ESP_LOGI(BUTTON_TAG, "skip button pressed, notifying scheduler");
+            xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
+        }
+    }
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
@@ -336,17 +360,50 @@ void MqttMsg_Task(void *arg) {
 
                     if (commandDoc != nullptr) {
                         const char *type = cJSON_GetObjectItem(commandDoc, "type")->valuestring;
-                        if (strcmp(type, "sleep") == 0) {
+                        if (strcmp(type, "matrix_sleep") == 0) {
                             ESP_LOGI(MQTT_TASK_TAG, "sleeping");
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithOverwrite);
-                        } else if (strcmp(type, "wake") == 0) {
+                        } else if (strcmp(type, "matrix_wake") == 0) {
                             ESP_LOGI(MQTT_TASK_TAG, "waking up");
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithOverwrite);
-                        } else if (strcmp(type, "ota") == 0) {
+                        } else if (strcmp(type, "ota_update") == 0) {
+                            // get the firmware URL
                             const char *firmwareURL = cJSON_GetObjectItem(commandDoc, "firmwareURL")->valuestring;
                             char *firmwareURLp = (char *)malloc(200);
                             strcpy(firmwareURLp, firmwareURL);
+
+                            // start the OTA task in the background (allows MQTT processing to continue)
                             xTaskCreatePinnedToCore(OTA_Task, "OTA", 5000, (void *)firmwareURLp, 5, NULL, 0);
+                        } else if (strcmp(type, "pin_sprite") == 0) {
+                            // clear all pin states
+                            int i = 0;
+                            while (true) {
+                                if (scheduledItems[i].show_duration == 0) {
+                                    break;
+                                }
+                                scheduledItems[i].is_pinned = false;
+                                i++;
+                            }
+
+                            // pin the mentioned sprite
+                            int pinnedSprite = cJSON_GetObjectItem(commandDoc, "spriteID")->valueint;
+                            scheduledItems[pinnedSprite].is_pinned = true;
+
+                            // notify task
+                            xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_PINNED, eSetValueWithOverwrite);
+                        } else if (strcmp(type, "unpin_sprite") == 0) {
+                            // clear all pin states
+                            int i = 0;
+                            while (true) {
+                                if (scheduledItems[i].show_duration == 0) {
+                                    break;
+                                }
+                                scheduledItems[i].is_pinned = false;
+                                i++;
+                            }
+
+                            // notify task
+                            xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
                         }
                     }
 
@@ -586,6 +643,36 @@ void Schedule_Task(void *arg) {
         if (xTaskNotifyWait(pdTRUE, pdTRUE, &notifiedValue, pdMS_TO_TICKS(1000))) {
             if (notifiedValue == SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT) {
                 needToSkip = true;
+            } else if (notifiedValue == SCHEDULE_TASK_NOTIF_SKIP_TO_PINNED) {
+                int i = 0;
+                while (true) {
+                    if (scheduledItems[i].show_duration == 0) {
+                        i = -1;
+                        break;
+                    }
+
+                    if (scheduledItems[i].is_pinned == true) {
+                        break;
+                    }
+                    i++;
+                }
+
+                // i now contains (-1) for error, or the id of the sprite that is now pinned.
+                if (i == -1) {
+                    ESP_LOGE(SCHEDULE_TAG, "skipping sprite pinning logic as loop reported error");
+                    continue;
+                }
+
+                currentlyDisplayingSprite = i;
+                ESP_LOGI(SCHEDULE_TAG, "received pin request for sprite %d!", currentlyDisplayingSprite);
+
+                // actually display the sprite!
+                workItem newWorkItem;
+                newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
+                newWorkItem.workItemInteger = 1;
+                snprintf(newWorkItem.workItemString, 4, "%d", currentlyDisplayingSprite);
+                xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
+                currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
             }
         }
 
@@ -612,6 +699,14 @@ void Schedule_Task(void *arg) {
         if ((pdTICKS_TO_MS(xTaskGetTickCount()) - currentSpriteStartTime > (scheduledItems[currentlyDisplayingSprite].show_duration * 1000)) ||
             needToSkip) {
             if (scheduledItems[currentlyDisplayingSprite].is_pinned && !needToSkip) {
+                // the current sprite is pinned and is time for an update
+                char resp[200];
+                char tmpTopic[200];
+                snprintf(tmpTopic, 200, "smartmatrix/%s/status", thing_name);
+                const esp_app_desc_t *app_desc = esp_app_get_description();
+                snprintf(resp, 200, "{\"type\": \"report\", \"currentSpriteID\":%d, \"nextSpriteID\": %d, \"appVersion\": \"%s\"}",
+                         currentlyDisplayingSprite, currentlyDisplayingSprite, app_desc->version);
+                esp_mqtt_client_publish(mqttClient, tmpTopic, resp, 0, 0, false);
                 currentSpriteStartTime = pdTICKS_TO_MS(xTaskGetTickCount());
                 continue;
             }
@@ -665,11 +760,30 @@ extern "C" void app_main(void) {
     desiredBrightness = 255;
     matrix.setBrightness8(0);
 
+    pin_button.gpio = IO_BTN_USER2;
+    skip_button.gpio = IO_BTN_USER1;
+
+    pin_button.pressed_level = 0;
+    skip_button.pressed_level = 0;
+
+    pin_button.callback = on_button;
+    skip_button.callback = on_button;
+
+    ESP_ERROR_CHECK(button_init(&pin_button));
+    ESP_ERROR_CHECK(button_init(&skip_button));
+
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    // if both buttons are pressed upon startup, reset the device to factory defaults!
+    if (gpio_get_level(IO_BTN_USER1) == 0 && gpio_get_level(IO_BTN_USER2) == 0) {
+        ESP_LOGW(BOOT_TAG, "resetting provisioning status!");
+        ESP_ERROR_CHECK(wifi_prov_mgr_reset_provisioning());
+        esp_restart();
     }
 
     esp_vfs_littlefs_conf_t conf = {
