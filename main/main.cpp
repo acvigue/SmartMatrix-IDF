@@ -769,8 +769,8 @@ extern "C" void app_main(void) {
     pin_button.callback = on_button;
     skip_button.callback = on_button;
 
-    ESP_ERROR_CHECK(button_init(&pin_button));
-    ESP_ERROR_CHECK(button_init(&skip_button));
+    //ESP_ERROR_CHECK(button_init(&pin_button));
+    //ESP_ERROR_CHECK(button_init(&skip_button));
 
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
