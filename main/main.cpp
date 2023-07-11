@@ -358,7 +358,7 @@ void OTA_Task(void *arg) {
 
     while (true) {
         if (wifiConnected) {
-            vTaskDelay(pdMS_TO_TICKS(1000 * 30));
+            vTaskDelay(pdMS_TO_TICKS(1000 * 60 * 5));
             ESP_LOGI(OTA_TAG, "ota update starting!");
             char http_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
             esp_http_client_config_t manifest_config = {.url = OTA_MANIFEST_URL,
@@ -377,9 +377,12 @@ void OTA_Task(void *arg) {
                 ESP_LOGE(HTTP_TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
             }
 
+            esp_http_client_cleanup(manifest_client);
+
             cJSON *manifestDoc = cJSON_ParseWithLength(http_response_buffer, strlen(http_response_buffer));
             if (!cJSON_IsObject(manifestDoc)) {
                 ESP_LOGE(OTA_TAG, "manifest document was not an object!");
+                esp_restart();
                 continue;
             }
 
@@ -396,6 +399,9 @@ void OTA_Task(void *arg) {
             const char *otaBinPath = cJSON_GetObjectItem(manifestDoc, "bin")->valuestring;
             const char *otaFSPath = cJSON_GetObjectItem(manifestDoc, "spiffs")->valuestring;
 
+            char binURL[200];
+            snprintf(binURL, 200, "https://%s:%d%s", otaHost, otaPort, otaBinPath);
+
             semver_t current_version = {};
             semver_t compare_version = {};
 
@@ -403,6 +409,8 @@ void OTA_Task(void *arg) {
                 ESP_LOGE(OTA_TAG, "could not parse version strings!");
                 continue;
             }
+
+            cJSON_Delete(manifestDoc);
 
             bool otaRequired = semver_compare(compare_version, current_version) > 0;
 
@@ -415,9 +423,6 @@ void OTA_Task(void *arg) {
             }
 
             ESP_LOGI(OTA_TAG, "firmware (%s) is out of date, OTA updating to version %s", app_desc->version, otaVersion);
-            char binURL[200];
-            snprintf(binURL, 200, "https://%s:%d%s", otaHost, otaPort, otaBinPath);
-
             ESP_LOGI(OTA_TAG, "built firmware binary URL: %s", binURL);
 
             esp_http_client_config_t config = {.url = binURL, .crt_bundle_attach = esp_crt_bundle_attach};
@@ -989,5 +994,7 @@ extern "C" void app_main(void) {
             }
         }
         vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI(BOOT_TAG, "free heap: %" PRIu32 " internal: %" PRIu32 " contig: %d", esp_get_free_heap_size(), esp_get_free_internal_heap_size(),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     }
 }
