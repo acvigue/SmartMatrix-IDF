@@ -48,24 +48,29 @@ int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
 bool wifiConnected, mqttConnected = false;
 
 static void on_button(button_t *btn, button_state_t state) {
-    if (state == BUTTON_PRESSED) {
-        if (btn == &pin_button) {
-            // clear all pin states
-            int i = 0;
-            while (true) {
-                if (scheduledItems[i].show_duration == 0) {
-                    break;
-                }
-                scheduledItems[i].is_pinned = false;
-                i++;
-            }
+    if (!mqttConnected || !wifiConnected) {
+        return;
+    }
+    if (state != BUTTON_PRESSED) {
+        return;
+    }
 
-            ESP_LOGI(BUTTON_TAG, "pin button pressed, pinning current sprite");
-            scheduledItems[currentlyDisplayingSprite].is_pinned = true;
-        } else if (btn == &skip_button) {
-            ESP_LOGI(BUTTON_TAG, "skip button pressed, notifying scheduler");
-            xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
+    if (btn == &pin_button) {
+        // clear all pin states
+        int i = 0;
+        while (true) {
+            if (scheduledItems[i].show_duration == 0) {
+                break;
+            }
+            scheduledItems[i].is_pinned = false;
+            i++;
         }
+
+        ESP_LOGI(BUTTON_TAG, "pin button pressed, pinning current sprite");
+        scheduledItems[currentlyDisplayingSprite].is_pinned = true;
+    } else if (btn == &skip_button) {
+        ESP_LOGI(BUTTON_TAG, "skip button pressed, notifying scheduler");
+        xTaskNotify(scheduleTask, SCHEDULE_TASK_NOTIF_SKIP_TO_NEXT, eSetValueWithOverwrite);
     }
 }
 
@@ -345,7 +350,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 }
 
 void OTA_Task(void *arg) {
-    if(strlen(OTA_MANIFEST_URL) == 0) {
+    if (strlen(OTA_MANIFEST_URL) == 0) {
         ESP_LOGE(OTA_TAG, "skipping OTA task setup, no manifest given..");
         return;
     }
@@ -353,7 +358,8 @@ void OTA_Task(void *arg) {
 
     while (true) {
         if (wifiConnected) {
-            vTaskDelay(pdMS_TO_TICKS(1000 * 60 * 5));
+            vTaskDelay(pdMS_TO_TICKS(1000 * 30));
+            ESP_LOGI(OTA_TAG, "ota update starting!");
             char http_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
             esp_http_client_config_t manifest_config = {.url = OTA_MANIFEST_URL,
                                                         .disable_auto_redirect = false,
@@ -378,7 +384,7 @@ void OTA_Task(void *arg) {
             }
 
             const char *otaType = cJSON_GetObjectItem(manifestDoc, "type")->valuestring;
-            if(strcmp(otaType, "smartmatrix") != 0) {
+            if (strcmp(otaType, "smartmatrix") != 0) {
                 ESP_LOGE(OTA_TAG, "manifest device types are not equal, skipping update!");
                 continue;
             }
@@ -888,13 +894,6 @@ extern "C" void app_main(void) {
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    // if both buttons are pressed upon startup, reset the device to factory defaults!
-    if (gpio_get_level(IO_BTN_USER1) == 0 && gpio_get_level(IO_BTN_USER2) == 0) {
-        ESP_LOGW(BOOT_TAG, "resetting provisioning status!");
-        ESP_ERROR_CHECK(wifi_prov_mgr_reset_provisioning());
-        esp_restart();
-    }
-
     esp_vfs_littlefs_conf_t conf = {
         .base_path = "/fs",
         .partition_label = "littlefs",
@@ -915,9 +914,6 @@ extern "C" void app_main(void) {
 
     pin_button.callback = on_button;
     skip_button.callback = on_button;
-
-    ESP_ERROR_CHECK(button_init(&pin_button));
-    ESP_ERROR_CHECK(button_init(&skip_button));
 
     ESP_ERROR_CHECK(i2cdev_init());
 
@@ -964,6 +960,22 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // if both buttons are pressed upon startup, reset the device to factory defaults!
+    if (gpio_get_level(IO_BTN_USER1) == 0 && gpio_get_level(IO_BTN_USER2) == 0) {
+        while (gpio_get_level(IO_BTN_USER1) == 0 || gpio_get_level(IO_BTN_USER2) == 0) {
+            ESP_LOGI(BOOT_TAG, "release button pls!");
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        ESP_LOGW(BOOT_TAG, "resetting provisioning status!");
+        wifi_prov_mgr_config_t config = {.scheme = wifi_prov_scheme_ble, .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM};
+        ESP_ERROR_CHECK(wifi_prov_mgr_init(config));
+        ESP_ERROR_CHECK(wifi_prov_mgr_reset_provisioning());
+        esp_restart();
+    }
+
+    ESP_ERROR_CHECK(button_init(&pin_button));
+    ESP_ERROR_CHECK(button_init(&skip_button));
+
     while (1) {
         uint32_t lux;
         esp_err_t res;
@@ -976,6 +988,6 @@ extern "C" void app_main(void) {
                 desiredBrightness = 0;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
