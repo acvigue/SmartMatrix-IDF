@@ -26,6 +26,7 @@
 
 #include "constants.h"
 #include "secrets.h"
+#include "semver.h"
 
 WebPData webPData;
 esp_mqtt_client_handle_t mqttClient;
@@ -33,7 +34,7 @@ esp_mqtt_client_handle_t mqttClient;
 scheduledItem *scheduledItems = nullptr;
 
 QueueHandle_t xWorkerQueue, xMqttMessageQueue;
-TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask;
+TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask, otaTask;
 TimerHandle_t tslTimer, brightnessTimer;
 
 HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
@@ -44,6 +45,7 @@ button_t skip_button, pin_button;
 
 char thing_name[18];
 int currentlyDisplayingSprite, desiredBrightness, currentBrightness = 0;
+bool wifiConnected, mqttConnected = false;
 
 static void on_button(button_t *btn, button_state_t state) {
     if (state == BUTTON_PRESSED) {
@@ -67,17 +69,89 @@ static void on_button(button_t *btn, button_state_t state) {
     }
 }
 
+esp_err_t http_event_handler(esp_http_client_event_t *evt) {
+    static char *output_buffer;  // Buffer to store response of http request from event handler
+    static int output_len;       // Stores number of bytes read
+    switch (evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ERROR");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_CONNECTED");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+        case HTTP_EVENT_ON_DATA:
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            /*
+             *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+             *  However, event handler can also be used in case chunked encoding is used.
+             */
+            if (!esp_http_client_is_chunked_response(evt->client)) {
+                // If user_data buffer is configured, copy the response into the buffer
+                int copy_len = 0;
+                if (evt->user_data) {
+                    copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
+                    if (copy_len) {
+                        memcpy(evt->user_data + output_len, evt->data, copy_len);
+                    }
+                } else {
+                    const int buffer_len = esp_http_client_get_content_length(evt->client);
+                    if (output_buffer == NULL) {
+                        output_buffer = (char *)malloc(buffer_len);
+                        output_len = 0;
+                        if (output_buffer == NULL) {
+                            ESP_LOGE(HTTP_TAG, "Failed to allocate memory for output buffer");
+                            return ESP_FAIL;
+                        }
+                    }
+                    copy_len = MIN(evt->data_len, (buffer_len - output_len));
+                    if (copy_len) {
+                        memcpy(output_buffer + output_len, evt->data, copy_len);
+                    }
+                }
+                output_len += copy_len;
+            }
+
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGD(HTTP_TAG, "HTTP_EVENT_ON_FINISH");
+            if (output_buffer != NULL) {
+                free(output_buffer);
+                output_buffer = NULL;
+            }
+            output_len = 0;
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(HTTP_TAG, "HTTP_EVENT_DISCONNECTED");
+            if (output_buffer != NULL) {
+                free(output_buffer);
+                output_buffer = NULL;
+            }
+            output_len = 0;
+            break;
+        case HTTP_EVENT_REDIRECT:
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     static char lastTopic[200];
-    static int failureCount = 0;
     static char *dataBuf = nullptr;
     static bool hasConnected = false;
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED: {
+            mqttConnected = true;
             ESP_LOGI(MQTT_TAG, "connected to broker..");
-            failureCount = 0;
 
             // Device shadow topics.
             char tmpTopic[200];
@@ -91,9 +165,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             sprintf(tmpTopic, "smartmatrix/%s/command", thing_name);
             esp_mqtt_client_subscribe(event->client, tmpTopic, 1);
 
-            // Request to get the initial shadow state
-            sprintf(tmpTopic, "smartmatrix/%s/status", thing_name);
-            esp_mqtt_client_publish(event->client, tmpTopic, "{\"type\":\"get_schedule\"}", 0, 0, false);
             if (!hasConnected) {
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
@@ -104,11 +175,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             break;
         }
         case MQTT_EVENT_DISCONNECTED:
+            mqttConnected = false;
             ESP_LOGI(MQTT_TAG, "mqtt disconnected");
-            failureCount++;
-            if (failureCount > 5) {
-                esp_restart();
-            }
             break;
         case MQTT_EVENT_DATA:
             if (event->topic_len != 0) {
@@ -152,7 +220,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
-                strcpy(newWorkItem.workItemString, "cred_failed");
+                strcpy(newWorkItem.workItemString, "connect_wifi_failed");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 wifi_prov_mgr_reset_sm_state_on_failure();
 
@@ -176,7 +244,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
-                strcpy(newWorkItem.workItemString, "setup_wifi");
+                strcpy(newWorkItem.workItemString, "setup");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
                 break;
             }
@@ -185,12 +253,8 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
-                strcpy(newWorkItem.workItemString, "check_cred");
+                strcpy(newWorkItem.workItemString, "connect_wifi");
                 xQueueSend(xWorkerQueue, &newWorkItem, pdMS_TO_TICKS(1000));
-                ESP_LOGI(PROV_TAG,
-                         "Received Wi-Fi credentials"
-                         "\n\tSSID     : %s\n\tPassword : %s",
-                         (const char *)wifi_sta_cfg->ssid, (const char *)wifi_sta_cfg->password);
                 break;
             }
         }
@@ -231,6 +295,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             }
             case WIFI_EVENT_STA_DISCONNECTED: {
                 wifiConnectionAttempts++;
+                wifiConnected = false;
                 ESP_LOGI(WIFI_TAG, "STA disconnected");
                 esp_mqtt_client_stop(mqttClient);
                 if (wifiConnectionAttempts > 5 && !provisioning) {
@@ -250,6 +315,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     } else if (event_base == IP_EVENT) {
         if (event_id == IP_EVENT_STA_GOT_IP) {
             wifiConnectionAttempts = 0;
+            wifiConnected = true;
             ESP_LOGI(WIFI_TAG, "STA connected, starting MQTT connection");
 
             workItem newWorkItem;
@@ -279,19 +345,88 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 }
 
 void OTA_Task(void *arg) {
-    char *firmwareURL = (char *)arg;
-    ESP_LOGI(OTA_TAG, "ota update task started, firmware URL: %s", firmwareURL);
-
-    esp_http_client_config_t config = {.url = firmwareURL, .crt_bundle_attach = esp_crt_bundle_attach};
-    esp_https_ota_config_t ota_config = {.http_config = &config, .partial_http_download = true};
-    esp_err_t ret = esp_https_ota(&ota_config);
-    if (ret == ESP_OK) {
-        ESP_LOGI(OTA_TAG, "ota done, restarting");
-        esp_restart();
-    } else {
-        ESP_LOGE(OTA_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
+    if(strlen(OTA_MANIFEST_URL) == 0) {
+        ESP_LOGE(OTA_TAG, "skipping OTA task setup, no manifest given..");
+        return;
     }
-    free(firmwareURL);
+    ESP_LOGI(OTA_TAG, "ota update task started, manifest URL: %s", OTA_MANIFEST_URL);
+
+    while (true) {
+        if (wifiConnected) {
+            vTaskDelay(pdMS_TO_TICKS(1000 * 60 * 5));
+            char http_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
+            esp_http_client_config_t manifest_config = {.url = OTA_MANIFEST_URL,
+                                                        .disable_auto_redirect = false,
+                                                        .event_handler = http_event_handler,
+                                                        .user_data = http_response_buffer,
+                                                        .crt_bundle_attach = esp_crt_bundle_attach};
+            esp_http_client_handle_t manifest_client = esp_http_client_init(&manifest_config);
+
+            // GET
+            esp_err_t err = esp_http_client_perform(manifest_client);
+            if (err == ESP_OK) {
+                ESP_LOGI(HTTP_TAG, "HTTP GET Status = %d, content_length = %" PRId64, esp_http_client_get_status_code(manifest_client),
+                         esp_http_client_get_content_length(manifest_client));
+            } else {
+                ESP_LOGE(HTTP_TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+            }
+
+            cJSON *manifestDoc = cJSON_ParseWithLength(http_response_buffer, strlen(http_response_buffer));
+            if (!cJSON_IsObject(manifestDoc)) {
+                ESP_LOGE(OTA_TAG, "manifest document was not an object!");
+                continue;
+            }
+
+            const char *otaType = cJSON_GetObjectItem(manifestDoc, "type")->valuestring;
+            if(strcmp(otaType, "smartmatrix") != 0) {
+                ESP_LOGE(OTA_TAG, "manifest device types are not equal, skipping update!");
+                continue;
+            }
+
+            const esp_app_desc_t *app_desc = esp_app_get_description();
+            const char *otaVersion = cJSON_GetObjectItem(manifestDoc, "version")->valuestring;
+            const char *otaHost = cJSON_GetObjectItem(manifestDoc, "host")->valuestring;
+            int otaPort = cJSON_GetObjectItem(manifestDoc, "port")->valueint;
+            const char *otaBinPath = cJSON_GetObjectItem(manifestDoc, "bin")->valuestring;
+            const char *otaFSPath = cJSON_GetObjectItem(manifestDoc, "spiffs")->valuestring;
+
+            semver_t current_version = {};
+            semver_t compare_version = {};
+
+            if (semver_parse(app_desc->version, &current_version) || semver_parse(otaVersion, &compare_version)) {
+                ESP_LOGE(OTA_TAG, "could not parse version strings!");
+                continue;
+            }
+
+            bool otaRequired = semver_compare(compare_version, current_version) > 0;
+
+            semver_free(&current_version);
+            semver_free(&compare_version);
+
+            if (!otaRequired) {
+                ESP_LOGI(OTA_TAG, "firmware (%s) is up to date, no OTA necessary..", app_desc->version);
+                continue;
+            }
+
+            ESP_LOGI(OTA_TAG, "firmware (%s) is out of date, OTA updating to version %s", app_desc->version, otaVersion);
+            char binURL[200];
+            snprintf(binURL, 200, "https://%s:%d%s", otaHost, otaPort, otaBinPath);
+
+            ESP_LOGI(OTA_TAG, "built firmware binary URL: %s", binURL);
+
+            esp_http_client_config_t config = {.url = binURL, .crt_bundle_attach = esp_crt_bundle_attach};
+            esp_https_ota_config_t ota_config = {.http_config = &config, .partial_http_download = true};
+            esp_err_t ret = esp_https_ota(&ota_config);
+            if (ret == ESP_OK) {
+                ESP_LOGI(OTA_TAG, "ota done, restarting");
+            } else {
+                ESP_LOGE(OTA_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
+            }
+            esp_restart();
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
 }
 
 void MqttMsg_Task(void *arg) {
@@ -366,14 +501,6 @@ void MqttMsg_Task(void *arg) {
                         } else if (strcmp(type, "matrix_wake") == 0) {
                             ESP_LOGI(MQTT_TASK_TAG, "waking up");
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_WAKE_UP, eSetValueWithOverwrite);
-                        } else if (strcmp(type, "ota_update") == 0) {
-                            // get the firmware URL
-                            const char *firmwareURL = cJSON_GetObjectItem(commandDoc, "firmwareURL")->valuestring;
-                            char *firmwareURLp = (char *)malloc(200);
-                            strcpy(firmwareURLp, firmwareURL);
-
-                            // start the OTA task in the background (allows MQTT processing to continue)
-                            xTaskCreatePinnedToCore(OTA_Task, "OTA", 5000, (void *)firmwareURLp, 5, NULL, 0);
                         } else if (strcmp(type, "pin_sprite") == 0) {
                             // clear all pin states
                             int i = 0;
@@ -439,7 +566,7 @@ void Worker_Task(void *arg) {
                         if (scheduledItems[spriteID].pData == nullptr) {
                             ESP_LOGE(WORKER_TAG, "cannot copy buf from nullptr for sprite %d", spriteID);
 
-                            if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false) {
+                            if (scheduledItems[atoi(currentWorkItem.workItemString)].reported_error == false && mqttConnected) {
                                 scheduledItems[atoi(currentWorkItem.workItemString)].reported_error = true;
 
                                 ESP_LOGD(WORKER_TAG, "reporting error for %d", spriteID);
@@ -676,7 +803,7 @@ void Schedule_Task(void *arg) {
             }
         }
 
-        if (!mqttClient) {
+        if (!mqttClient || !mqttConnected) {
             continue;
         }
 
@@ -754,24 +881,6 @@ void Schedule_Task(void *arg) {
 }
 
 extern "C" void app_main(void) {
-    /* Start the matrix */
-    matrix.begin();
-    currentBrightness = 0;
-    desiredBrightness = 255;
-    matrix.setBrightness8(0);
-
-    pin_button.gpio = IO_BTN_USER2;
-    skip_button.gpio = IO_BTN_USER1;
-
-    pin_button.pressed_level = 0;
-    skip_button.pressed_level = 0;
-
-    pin_button.callback = on_button;
-    skip_button.callback = on_button;
-
-    //ESP_ERROR_CHECK(button_init(&pin_button));
-    //ESP_ERROR_CHECK(button_init(&skip_button));
-
     /* Initialize NVS partition */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -795,15 +904,37 @@ extern "C" void app_main(void) {
 
     ESP_ERROR_CHECK(esp_vfs_littlefs_register(&conf));
 
+    pin_button.gpio = IO_BTN_USER2;
+    skip_button.gpio = IO_BTN_USER1;
+
+    pin_button.pressed_level = 0;
+    skip_button.pressed_level = 0;
+
+    pin_button.internal_pull = false;
+    skip_button.internal_pull = false;
+
+    pin_button.callback = on_button;
+    skip_button.callback = on_button;
+
+    ESP_ERROR_CHECK(button_init(&pin_button));
+    ESP_ERROR_CHECK(button_init(&skip_button));
+
     ESP_ERROR_CHECK(i2cdev_init());
 
     tsl2561_init_desc(&tslSensor, 0x39, (i2c_port_t)0, (gpio_num_t)7, (gpio_num_t)6);
     tsl2561_init(&tslSensor);
 
+    /* Start the matrix */
+    matrix.begin();
+    currentBrightness = 0;
+    desiredBrightness = 255;
+    matrix.setBrightness8(0);
+
     xTaskCreatePinnedToCore(Worker_Task, "WorkerTask", 3500, NULL, 5, &workerTask, 1);
     xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 10000, NULL, 5, &mqttMsgTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
+    xTaskCreatePinnedToCore(OTA_Task, "OTA", 5000, NULL, 5, &otaTask, 0);
 
     ESP_ERROR_CHECK(esp_netif_init());
 

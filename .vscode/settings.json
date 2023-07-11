@@ -19,7 +19,9 @@
         "string": "cpp",
         "string_view": "cpp",
         "unordered_map": "cpp",
-        "vector": "cpp"
+        "vector": "cpp",
+        "__locale": "cpp",
+        "cstring": "cpp"
     },
     "idf.adapterTargetName": "esp32s3",
     "idf.openOcdConfigs": [

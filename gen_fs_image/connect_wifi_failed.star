@@ -1,10 +1,11 @@
-# Render duration 8300
+# Exmaple of how to use Stack with Rows and Columns to control quadrant position of text on the tidbyt.
+# Render duration: 19350
 
 load("render.star", "render")
 load("encoding/base64.star", "base64")
 
 WIFI_ICON = base64.decode("""
-R0lGODlhFwAMAPAAAAAAAPXknCH/C05FVFNDQVBFMi4wAwEAAAAh/wtJbWFnZU1hZ2ljaw1nYW1tYT0wLjQ1NDU1ACH5BAEUAAAALAAAAAAXAAwAAAIRhI+py+0Po5y02otZyKHzVwAAIf8LSW1hZ2VNYWdpY2sNZ2FtbWE9MC40NTQ1NQAh+QQBFAAAACwAAAAAFwAMAAACFISPqcvtD6OctNqALQiHa/9l2vYUACH/C0ltYWdlTWFnaWNrDWdhbW1hPTAuNDU0NTUAIfkEARQAAAAsAAAAABcADAAAAhiEj6nL7Q+jnChYS0FIW3aehcoXXqJBLgUAIf8LSW1hZ2VNYWdpY2sNZ2FtbWE9MC40NTQ1NQAh+QQBFAAAACwAAAAAFwAMAAACGYSPqcvdAWNwaSpL8c2c+g+G4qGN0YiUSgEAIf8LSW1hZ2VNYWdpY2sNZ2FtbWE9MC40NTQ1NQAh+QQBFAAAACwAAAAAFwAMAAACEYSPqcvtD6OctNqLWcih81cAACH/C0ltYWdlTWFnaWNrDWdhbW1hPTAuNDU0NTUAIfkEARQAAAAsAAAAABcADAAAAhSEj6nL7Q+jnLTagC0Ih2v/Zdr2FAAh/wtJbWFnZU1hZ2ljaw1nYW1tYT0wLjQ1NDU1ACH5BAEUAAAALAAAAAAXAAwAAAIYhI+py+0Po5woWEtBSFt2noXKF16iQS4FACH/C0ltYWdlTWFnaWNrDWdhbW1hPTAuNDU0NTUAIfkEARQAAAAsAAAAABcADAAAAhmEj6nL3QFjcGkqS/HNnPoPhuKhjdGIlEoBADs=
+iVBORw0KGgoAAAANSUhEUgAAABcAAAAMCAYAAACJOyb4AAAAAXNSR0IArs4c6QAAAIpJREFUOE+1kjEOgCAMRekVdNVN738g3XTVK5R0+AkS2080MJGQ/vdaKqnjkY7ZyQ1XVRURuaZFPYHx3EO58BEAL9zAEcANR+EfwGt4bWSAe14fDZTGXgf0Q70O2EjMJAwvA+w+HFuyDmDNANTcDMoQjIhtCjWvt6T1k1HXZA57FJk126LP5oAwQAbBb2kNuzsgSAAAAABJRU5ErkJggg==
 """)
 def main():
     return render.Root(
@@ -12,19 +13,17 @@ def main():
             children = [
 
                 # column to hold stuff at the top of the screen
-                render.Column(
+                render.Column(			
                     children = [
-
-                        # row to hold text with equal space between them
+					
+					
                     render.Box(
                     width = 64,
                     height = 11,
                     padding = 0,
-                    color = "#001253",
-                    child = render.Text("Check Wifi", color = "#DDD", font = "Dina_r400-6", offset = 0),
+                    color = "#CF0A0A",
+                    child = render.Text("Oops!", color = "#DDD", font = "Dina_r400-6", offset = 0),
                             )],
-                        
-                    
                 ),
 
                 #column to hold the stuff at the bottom of the screen
@@ -36,7 +35,7 @@ def main():
                         # row to hold text evenly distrubuted accross the row
 				render.Marquee(
 					width=64,
-					child=render.Text("Checking Wifi Settings", color = "#f2c665", font = "tb-8", offset = 1),
+					child=render.Text("Provisioning Failed...", color = "#f2c665", font = "tb-8", offset = 1),
 					offset_start=64,
 					offset_end=0,
 				)
