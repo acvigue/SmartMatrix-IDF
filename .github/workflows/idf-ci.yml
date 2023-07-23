@@ -14,13 +14,13 @@ jobs:
 
     steps:
     - name: Checkout repo
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         submodules: 'recursive'
     - uses: "finnp/create-file-action@master"
       env:
         FILE_NAME: "main/secrets.h"
-        FILE_BASE64: "I2lmbmRlZiBTRUNSRVRTX0gKI2RlZmluZSBTRUNSRVRTX0gKCiNkZWZpbmUgTVFUVF9IT1NUICIiCiNkZWZpbmUgTVFUVF9VU0VSTkFNRSAiIgojZGVmaW5lIE1RVFRfUEFTU1dPUkQgIiIKI2VuZGlm"
+        FILE_BASE64: "I2lmbmRlZiBTRUNSRVRTX0gKI2RlZmluZSBTRUNSRVRTX0gKCiNkZWZpbmUgTVFUVF9IT1NUICIiCiNkZWZpbmUgTVFUVF9VU0VSTkFNRSAiIgojZGVmaW5lIE1RVFRfUEFTU1dPUkQgIiIKCiNkZWZpbmUgT1RBX01BTklGRVNUX1VSTCAieCIKI2VuZGlm"
     - name: esp-idf build
       uses: espressif/esp-idf-ci-action@v1
       with:
