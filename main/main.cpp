@@ -156,6 +156,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED: {
             mqttConnected = true;
+            wifiConnected = true;
             ESP_LOGI(MQTT_TAG, "connected to broker..");
 
             // Device shadow topics.
@@ -375,6 +376,10 @@ void OTA_Task(void *arg) {
                          esp_http_client_get_content_length(manifest_client));
             } else {
                 ESP_LOGE(HTTP_TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
+                if(err == ESP_ERR_HTTP_CONNECT) {
+                    //socket error, only fixable by wlan disconnect.
+                    ESP_LOGI(HTTP_TAG, "restarting wifi subsystem due to socket error.");
+                }
             }
 
             esp_http_client_cleanup(manifest_client);
@@ -382,7 +387,7 @@ void OTA_Task(void *arg) {
             cJSON *manifestDoc = cJSON_ParseWithLength(http_response_buffer, strlen(http_response_buffer));
             if (!cJSON_IsObject(manifestDoc)) {
                 ESP_LOGE(OTA_TAG, "manifest document was not an object!");
-                esp_restart();
+                esp_wifi_disconnect();
                 continue;
             }
 
