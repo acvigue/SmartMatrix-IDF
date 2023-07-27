@@ -34,7 +34,7 @@ esp_mqtt_client_handle_t mqttClient;
 scheduledItem *scheduledItems = nullptr;
 
 QueueHandle_t xWorkerQueue, xMqttMessageQueue;
-TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask, otaTask;
+TaskHandle_t workerTask, mqttMsgTask, matrixTask, scheduleTask;
 TimerHandle_t tslTimer, brightnessTimer;
 
 HUB75_I2S_CFG::i2s_pins _pins = {R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
@@ -349,98 +349,19 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
 }
 
 void OTA_Task(void *arg) {
-    if (strlen(OTA_MANIFEST_URL) == 0) {
-        ESP_LOGE(OTA_TAG, "skipping OTA task setup, no manifest given..");
-        return;
+    char *binURL = (char *)arg;
+    ESP_LOGI(OTA_TAG, "firmware is out of date, OTA updating...");
+    ESP_LOGI(OTA_TAG, "firmware binary URL: %s", binURL);
+
+    esp_http_client_config_t config = {.url = binURL, .crt_bundle_attach = esp_crt_bundle_attach};
+    esp_https_ota_config_t ota_config = {.http_config = &config, .partial_http_download = true};
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(OTA_TAG, "ota done, restarting");
+    } else {
+        ESP_LOGE(OTA_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
     }
-    ESP_LOGI(OTA_TAG, "ota update task started, manifest URL: %s", OTA_MANIFEST_URL);
-
-    while (true) {
-        if (wifiConnected) {
-            vTaskDelay(pdMS_TO_TICKS(1000 * 60 * 5));
-            ESP_LOGI(OTA_TAG, "ota update starting!");
-            char http_response_buffer[MAX_HTTP_OUTPUT_BUFFER] = {0};
-            esp_http_client_config_t manifest_config = {.url = OTA_MANIFEST_URL,
-                                                        .disable_auto_redirect = false,
-                                                        .event_handler = http_event_handler,
-                                                        .user_data = http_response_buffer,
-                                                        .crt_bundle_attach = esp_crt_bundle_attach};
-            esp_http_client_handle_t manifest_client = esp_http_client_init(&manifest_config);
-
-            // GET
-            esp_err_t err = esp_http_client_perform(manifest_client);
-            if (err == ESP_OK) {
-                ESP_LOGI(HTTP_TAG, "HTTP GET Status = %d, content_length = %" PRId64, esp_http_client_get_status_code(manifest_client),
-                         esp_http_client_get_content_length(manifest_client));
-            } else {
-                ESP_LOGE(HTTP_TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
-                if(err == ESP_ERR_HTTP_CONNECT) {
-                    //socket error, only fixable by wlan disconnect.
-                    ESP_LOGI(HTTP_TAG, "restarting wifi subsystem due to socket error.");
-                }
-            }
-
-            esp_http_client_cleanup(manifest_client);
-
-            cJSON *manifestDoc = cJSON_ParseWithLength(http_response_buffer, strlen(http_response_buffer));
-            if (!cJSON_IsObject(manifestDoc)) {
-                ESP_LOGE(OTA_TAG, "manifest document was not an object!");
-                esp_wifi_disconnect();
-                continue;
-            }
-
-            const char *otaType = cJSON_GetObjectItem(manifestDoc, "type")->valuestring;
-            if (strcmp(otaType, "smartmatrix") != 0) {
-                ESP_LOGE(OTA_TAG, "manifest device types are not equal, skipping update!");
-                continue;
-            }
-
-            const esp_app_desc_t *app_desc = esp_app_get_description();
-            const char *otaVersion = cJSON_GetObjectItem(manifestDoc, "version")->valuestring;
-            const char *otaHost = cJSON_GetObjectItem(manifestDoc, "host")->valuestring;
-            int otaPort = cJSON_GetObjectItem(manifestDoc, "port")->valueint;
-            const char *otaBinPath = cJSON_GetObjectItem(manifestDoc, "bin")->valuestring;
-            const char *otaFSPath = cJSON_GetObjectItem(manifestDoc, "spiffs")->valuestring;
-
-            char binURL[200];
-            snprintf(binURL, 200, "https://%s:%d%s", otaHost, otaPort, otaBinPath);
-
-            semver_t current_version = {};
-            semver_t compare_version = {};
-
-            if (semver_parse(app_desc->version, &current_version) || semver_parse(otaVersion, &compare_version)) {
-                ESP_LOGE(OTA_TAG, "could not parse version strings!");
-                continue;
-            }
-
-            cJSON_Delete(manifestDoc);
-
-            bool otaRequired = semver_compare(compare_version, current_version) > 0;
-
-            semver_free(&current_version);
-            semver_free(&compare_version);
-
-            if (!otaRequired) {
-                ESP_LOGI(OTA_TAG, "firmware (%s) is up to date, no OTA necessary..", app_desc->version);
-                continue;
-            }
-
-            ESP_LOGI(OTA_TAG, "firmware (%s) is out of date, OTA updating to version %s", app_desc->version, otaVersion);
-            ESP_LOGI(OTA_TAG, "built firmware binary URL: %s", binURL);
-
-            esp_http_client_config_t config = {.url = binURL, .crt_bundle_attach = esp_crt_bundle_attach};
-            esp_https_ota_config_t ota_config = {.http_config = &config, .partial_http_download = true};
-            esp_err_t ret = esp_https_ota(&ota_config);
-            if (ret == ESP_OK) {
-                ESP_LOGI(OTA_TAG, "ota done, restarting");
-            } else {
-                ESP_LOGE(OTA_TAG, "ota failed, error code %d: %s", ret, esp_err_to_name(ret));
-            }
-            esp_restart();
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(5000));
-        }
-    }
+    esp_restart();
 }
 
 void MqttMsg_Task(void *arg) {
@@ -509,7 +430,12 @@ void MqttMsg_Task(void *arg) {
 
                     if (commandDoc != nullptr) {
                         const char *type = cJSON_GetObjectItem(commandDoc, "type")->valuestring;
-                        if (strcmp(type, "matrix_sleep") == 0) {
+                        if (strcmp(type, "ota") == 0) {
+                            const char *binURL = cJSON_GetObjectItem(commandDoc, "binURL")->valuestring;
+                            char *binURLp = (char *)malloc(100);
+                            strcpy(binURLp, binURL);
+                            xTaskCreatePinnedToCore(OTA_Task, "OTA", 5000, (void *)binURLp, 5, NULL, 0);
+                        } else if (strcmp(type, "matrix_sleep") == 0) {
                             ESP_LOGI(MQTT_TASK_TAG, "sleeping");
                             xTaskNotify(matrixTask, MATRIX_TASK_NOTIF_SLEEP, eSetValueWithOverwrite);
                         } else if (strcmp(type, "matrix_wake") == 0) {
@@ -938,7 +864,6 @@ extern "C" void app_main(void) {
     xTaskCreatePinnedToCore(MqttMsg_Task, "MqttMsgTask", 10000, NULL, 5, &mqttMsgTask, 1);
     xTaskCreatePinnedToCore(Matrix_Task, "MatrixTask", 4000, NULL, 5, &matrixTask, 1);
     xTaskCreatePinnedToCore(Schedule_Task, "ScheduleTask", 3500, NULL, 5, &scheduleTask, 1);
-    xTaskCreatePinnedToCore(OTA_Task, "OTA", 5000, NULL, 5, &otaTask, 0);
 
     ESP_ERROR_CHECK(esp_netif_init());
 
