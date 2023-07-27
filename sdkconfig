@@ -1976,11 +1976,24 @@ CONFIG_LED_STRIP_SPI_MUTEX_TIMEOUT_MS=1
 # end of LED strip SPI
 
 #
+# MAX1704X Battery Fuel Gauge
+#
+CONFIG_MAX1704X_MODEL_3_4=y
+# CONFIG_MAX1704X_MODEL_8_9 is not set
+# end of MAX1704X Battery Fuel Gauge
+
+#
 # MCP23x17
 #
 CONFIG_MCP23X17_IFACE_I2C=y
 # CONFIG_MCP23X17_IFACE_SPI is not set
 # end of MCP23x17
+
+#
+# MPU6050
+#
+# CONFIG_AUTO_CONFIG_ADDR is not set
+# end of MPU6050
 
 #
 # OneWire
@@ -2006,6 +2019,7 @@ CONFIG_LITTLEFS_MTIME_USE_SECONDS=y
 # CONFIG_LITTLEFS_MTIME_USE_NONCE is not set
 # CONFIG_LITTLEFS_SPIFFS_COMPAT is not set
 # CONFIG_LITTLEFS_FLUSH_FILE_EVERY_WRITE is not set
+# CONFIG_LITTLEFS_FCNTL_GET_PATH is not set
 # end of LittleFS
 # end of Component config
 
