@@ -255,8 +255,6 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                 break;
             }
             case WIFI_PROV_CRED_RECV: {
-                wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
-
                 workItem newWorkItem;
                 newWorkItem.workItemType = WorkItemType::SHOW_SPRITE;
                 strcpy(newWorkItem.workItemString, "connect_wifi");
@@ -990,8 +988,10 @@ extern "C" void app_main(void) {
         uint32_t lux;
         esp_err_t res;
         if ((res = tsl2561_read_lux(&tslSensor, &lux)) == ESP_OK) {
-            if (lux > 5) {
+            if (lux > 15) {
                 desiredBrightness = 100;
+            } else if (lux > 5) {
+                desiredBrightness = 50;
             } else if (lux > 0) {
                 desiredBrightness = 25;
             } else {
