@@ -6,20 +6,23 @@
 
 An infinitely customizable internet-connected smart RGB LED matrix powered by an ESP32
 
+Currently only supports the ESP32-S3.
 
-
-
-## Deployment
+## Configuration
 
 Copy the `secrets.h.example` file to `secrets.h` and fill in relevant information. OTA can be disabled by leaving the manifest URL empty
 
-To deploy, compile and upload using ESP-IDF v5.1
+To use a Tidbyt, uncomment the #define PINDEF_TIDBYT line
 
+To deploy, compile and upload using ESP-IDF v5.2
+
+## Installation
+
+Use VSCode with the ESP-IDF extension to build & flash this project to your device. 
 
 ## Requirements
 
 This project requires a MQTT server and the [SmartMatrixServer](https://github.com/acvigue/SmartMatrixServer) to function properly.
-
 
 ## Authors
 
